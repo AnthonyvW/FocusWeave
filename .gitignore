@@ -1,0 +1,6 @@
+depth.png
+output.tiff
+focus_scores/*
+*.jpg
+venv/
+__pycache__/
