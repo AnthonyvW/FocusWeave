@@ -114,26 +114,57 @@ def _chain_affines(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return (a3 @ b3)[:2]
 
 
+def _invert_affine(warp: np.ndarray) -> np.ndarray:
+    """Invert a 2x3 affine matrix."""
+    m3 = np.vstack([warp, [0.0, 0.0, 1.0]])
+    return np.linalg.inv(m3)[:2]
+
+
+def _run_ecc(ref_gray: np.ndarray, src_gray: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Run the coarse-to-fine ECC cascade. Returns (warp, converged)."""
+    identity = np.eye(2, 3, dtype=np.float32)
+    warp = identity.copy()
+    for max_res, rough in [(256, True), (2048, False)]:
+        try:
+            warp = _ecc_align(ref_gray, src_gray, max_res, rough)
+        except cv2.error:
+            return identity.copy(), False
+    return warp, True
+
+
+def _report_warp(label: str, warp: np.ndarray) -> None:
+    angle = np.degrees(np.arctan2(warp[1, 0], warp[0, 0]))
+    tx, ty = warp[0, 2], warp[1, 2]
+    print(f"  {label}: rotation {angle:+.2f}°  shift ({ty:+.1f}, {tx:+.1f}) px")
+
+
 def align_images(
     src_paths: list[Path],
     reference_size: tuple[int, int],
+    reference_idx: int = 0,
+    global_align: bool = False,
     min_shift: float = 5.0,
 ) -> list[np.ndarray]:
-    """Compute cumulative affine warps for all images using neighbour-chained ECC.
+    """Compute affine warps for all images relative to reference_idx.
 
-    ECC is run on raw unwarped grayscale neighbor pairs so that interpolation
-    error from warp application never feeds back into subsequent alignment steps.
-    Warp matrices are chained purely mathematically. Only two raw grayscale
-    arrays are live at any time.
+    Two strategies are supported:
 
-    Returns a list of 2×3 float32 warp matrices, one per image. The first is
-    always identity. Images that fail to converge or fall below min_shift get
-    the previous cumulative warp (not identity) so the chain remains consistent.
+    Neighbour-chained (default): ECC is run on consecutive raw grayscale pairs.
+    Warps are composed mathematically so interpolation error never accumulates.
+    Images after reference_idx chain forward; images before it chain backward
+    by inverting each neighbour warp.
+
+    Global (global_align=True): every image is aligned directly to the reference
+    grayscale. No chaining — each warp is the raw ECC result. More robust when
+    images are not ordered by similarity, but more sensitive to large displacements.
+
+    In both modes the reference image always receives an identity warp, and
+    images whose cumulative transform is negligible (below min_shift with no
+    meaningful rotation/scale) are assigned identity.
     """
     ref_w, ref_h = reference_size
     identity = np.eye(2, 3, dtype=np.float32)
-    warps: list[np.ndarray] = [identity.copy()]
-    cumulative_warp = identity.copy()
+    n = len(src_paths)
 
     def _load_raw_gray(path: Path) -> np.ndarray:
         img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
@@ -141,40 +172,74 @@ def align_images(
             img = cv2.resize(img, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
         return _to_gray_cv(img)
 
-    prev_gray = _load_raw_gray(src_paths[0])
+    def _is_negligible(warp: np.ndarray) -> bool:
+        translation = np.linalg.norm(warp[:, 2])
+        linear_is_identity = np.allclose(warp[:, :2], np.eye(2), atol=1e-3)
+        return translation < min_shift and linear_is_identity
 
-    for i in range(1, len(src_paths)):
+    ref_gray = _load_raw_gray(src_paths[reference_idx])
+    warps: list[np.ndarray] = [identity.copy()] * n
+    warps[reference_idx] = identity.copy()
+
+    if global_align:
+        for i in range(n):
+            if i == reference_idx:
+                continue
+            src_gray = _load_raw_gray(src_paths[i])
+            warp, converged = _run_ecc(ref_gray, src_gray)
+            label = f"Image {i + 1}"
+            if not converged:
+                print(f"  {label}: ECC did not converge — using identity")
+                warps[i] = identity.copy()
+            elif _is_negligible(warp):
+                print(f"  {label}: transform negligible — skipped")
+                warps[i] = identity.copy()
+            else:
+                _report_warp(label, warp)
+                warps[i] = warp
+        return warps
+
+    # Neighbour-chained: forward pass (reference_idx -> end)
+    cumulative = identity.copy()
+    prev_gray = ref_gray
+    for i in range(reference_idx + 1, n):
         src_gray = _load_raw_gray(src_paths[i])
-
-        warp = identity.copy()
-        converged = True
-        for max_res, rough in [(256, True), (2048, False)]:
-            try:
-                warp = _ecc_align(prev_gray, src_gray, max_res, rough)
-            except cv2.error:
-                converged = False
-                break
-
+        warp, converged = _run_ecc(prev_gray, src_gray)
         prev_gray = src_gray
-
+        label = f"Image {i + 1}"
         if not converged:
-            print(f"  Image {i + 1}: ECC did not converge — using previous transform")
-            warps.append(cumulative_warp.copy())
+            print(f"  {label}: ECC did not converge — using previous transform")
+            warps[i] = cumulative.copy()
             continue
+        cumulative = _chain_affines(cumulative, warp)
+        if _is_negligible(cumulative):
+            print(f"  {label}: transform negligible — skipped")
+            warps[i] = identity.copy()
+        else:
+            _report_warp(label, cumulative)
+            warps[i] = cumulative.copy()
 
-        cumulative_warp = _chain_affines(cumulative_warp, warp)
-
-        translation = np.linalg.norm(cumulative_warp[:, 2])
-        is_identity_linear = np.allclose(cumulative_warp[:, :2], np.eye(2), atol=1e-3)
-        if translation < min_shift and is_identity_linear:
-            print(f"  Image {i + 1}: transform negligible — skipped")
-            warps.append(identity.copy())
+    # Neighbour-chained: backward pass (reference_idx -> start), warps inverted
+    cumulative = identity.copy()
+    prev_gray = ref_gray
+    for i in range(reference_idx - 1, -1, -1):
+        src_gray = _load_raw_gray(src_paths[i])
+        # Align prev (closer to reference) -> src (further from reference),
+        # then invert so the warp maps src into the reference frame.
+        warp, converged = _run_ecc(prev_gray, src_gray)
+        prev_gray = src_gray
+        label = f"Image {i + 1}"
+        if not converged:
+            print(f"  {label}: ECC did not converge — using previous transform")
+            warps[i] = cumulative.copy()
             continue
-
-        angle = np.degrees(np.arctan2(cumulative_warp[1, 0], cumulative_warp[0, 0]))
-        tx, ty = cumulative_warp[0, 2], cumulative_warp[1, 2]
-        print(f"  Image {i + 1}: rotation {angle:+.2f}°  shift ({ty:+.1f}, {tx:+.1f}) px")
-        warps.append(cumulative_warp.copy())
+        cumulative = _chain_affines(cumulative, _invert_affine(warp))
+        if _is_negligible(cumulative):
+            print(f"  {label}: transform negligible — skipped")
+            warps[i] = identity.copy()
+        else:
+            _report_warp(label, cumulative)
+            warps[i] = cumulative.copy()
 
     return warps
 
@@ -409,6 +474,22 @@ def main() -> None:
         help="Skip ECC alignment (use when images are already registered).",
     )
     parser.add_argument(
+        "--reference", type=int, default=0,
+        help=(
+            "Index of the image to use as the alignment reference (default: 0, i.e. the first image). "
+            "All other images are aligned so that this image receives an identity warp. "
+            "Images before the reference are chained backward; images after are chained forward."
+        ),
+    )
+    parser.add_argument(
+        "--global-align", action="store_true",
+        help=(
+            "Align every image directly to the reference instead of chaining through neighbours. "
+            "More robust when images are not ordered by similarity, but more sensitive to large "
+            "displacements between non-adjacent frames."
+        ),
+    )
+    parser.add_argument(
         "--min-shift", type=float, default=5.0,
         help="Minimum shift magnitude in pixels before alignment is applied (default: 5.0).",
     )
@@ -453,7 +534,6 @@ def main() -> None:
         print(f"Error: '{args.folder}' is not a directory.")
         sys.exit(1)
 
-
     checkpoints: list[_Checkpoint] = []
     t_total = time.perf_counter()
     tracemalloc.start()
@@ -463,14 +543,26 @@ def main() -> None:
     src_paths, reference_size = load_images(args.folder)
     t = _snap("Load", t, checkpoints)
 
+    n_images = len(src_paths)
+    if not (0 <= args.reference < n_images):
+        print(f"Error: --reference {args.reference} is out of range (0\u2013{n_images - 1}).")
+        sys.exit(1)
+
     ref_w, ref_h = reference_size
     levels = args.levels if args.levels > 0 else compute_levels((ref_h, ref_w))
-    print(f"Image size: {ref_w}x{ref_h}  |  Images: {len(src_paths)}  |  Pyramid levels: {levels}  |  Sharpness: {args.sharpness}  |  Dark threshold: {args.dark_threshold}")
+    print(f"Image size: {ref_w}x{ref_h}  |  Images: {n_images}  |  Pyramid levels: {levels}  |  Sharpness: {args.sharpness}  |  Dark threshold: {args.dark_threshold}")
 
     identity = np.eye(2, 3, dtype=np.float32)
     if not args.no_align:
-        print("Aligning (ECC affine, neighbour-chained)...")
-        warps = align_images(src_paths, reference_size, min_shift=args.min_shift)
+        strategy = "global" if args.global_align else "neighbour-chained"
+        print(f"Aligning (ECC affine, {strategy}, reference image {args.reference + 1})...")
+        warps = align_images(
+            src_paths,
+            reference_size,
+            reference_idx=args.reference,
+            global_align=args.global_align,
+            min_shift=args.min_shift,
+        )
         t = _snap("Align", t, checkpoints)
     else:
         print("Skipping alignment.")
