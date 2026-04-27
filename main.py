@@ -120,11 +120,25 @@ def _invert_affine(warp: np.ndarray) -> np.ndarray:
     return np.linalg.inv(m3)[:2]
 
 
-def _run_ecc(ref_gray: np.ndarray, src_gray: np.ndarray) -> tuple[np.ndarray, bool]:
-    """Run the coarse-to-fine ECC cascade. Returns (warp, converged)."""
+def _run_ecc(
+    ref_gray: np.ndarray,
+    src_gray: np.ndarray,
+    full_res: bool = False,
+) -> tuple[np.ndarray, bool]:
+    """Run the coarse-to-fine ECC cascade. Returns (warp, converged).
+
+    The fine pass resolution is adaptive: 2048px by default, or 4096px if the
+    image's long edge exceeds 4096px (i.e. 2048 would be less than half the
+    image size). With full_res=True it runs at the original image size instead.
+    """
     identity = np.eye(2, 3, dtype=np.float32)
     warp = identity.copy()
-    for max_res, rough in [(256, True), (2048, False)]:
+    if full_res:
+        fine_res = 2 ** 31
+    else:
+        long_edge = max(ref_gray.shape)
+        fine_res = 4096 if long_edge > 4096 else 2048
+    for max_res, rough in [(256, True), (fine_res, False)]:
         try:
             warp = _ecc_align(ref_gray, src_gray, max_res, rough)
         except cv2.error:
@@ -198,6 +212,7 @@ def align_images(
     no_scale: bool = False,
     no_shear: bool = False,
     no_translation: bool = False,
+    full_res: bool = False,
     min_shift: float = 5.0,
 ) -> list[np.ndarray]:
     """Compute affine warps for all images relative to reference_idx.
@@ -212,6 +227,9 @@ def align_images(
     Global (global_align=True): every image is aligned directly to the reference
     grayscale. No chaining — each warp is the raw ECC result. More robust when
     images are not ordered by similarity, but more sensitive to large displacements.
+
+    With full_res=True the fine ECC pass runs at the original image resolution
+    instead of 2048px, improving accuracy at the cost of speed.
 
     no_rotation, no_scale, no_shear, and no_translation constrain each per-step
     ECC warp before it is chained or used, so the constraints compose correctly
@@ -239,6 +257,9 @@ def align_images(
     def _constrain(warp: np.ndarray) -> np.ndarray:
         return _constrain_warp(warp, no_rotation, no_scale, no_shear, no_translation)
 
+    def _run(ref: np.ndarray, src: np.ndarray) -> tuple[np.ndarray, bool]:
+        return _run_ecc(ref, src, full_res)
+
     def _report(label: str, warp: np.ndarray) -> None:
         _report_warp(label, warp, no_rotation)
 
@@ -251,7 +272,7 @@ def align_images(
             if i == reference_idx:
                 continue
             src_gray = _load_raw_gray(src_paths[i])
-            warp, converged = _run_ecc(ref_gray, src_gray)
+            warp, converged = _run(ref_gray, src_gray)
             warp = _constrain(warp)
             label = f"Image {i + 1}"
             if not converged:
@@ -270,7 +291,7 @@ def align_images(
     prev_gray = ref_gray
     for i in range(reference_idx + 1, n):
         src_gray = _load_raw_gray(src_paths[i])
-        warp, converged = _run_ecc(prev_gray, src_gray)
+        warp, converged = _run(prev_gray, src_gray)
         warp = _constrain(warp)
         prev_gray = src_gray
         label = f"Image {i + 1}"
@@ -293,7 +314,7 @@ def align_images(
     prev_gray = ref_gray
     for i in range(reference_idx - 1, -1, -1):
         src_gray = _load_raw_gray(src_paths[i])
-        warp, converged = _run_ecc(prev_gray, src_gray)
+        warp, converged = _run(prev_gray, src_gray)
         warp = _constrain(warp)
         prev_gray = src_gray
         label = f"Image {i + 1}"
@@ -589,6 +610,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--full-res", action="store_true",
+        help=(
+            "Run the fine ECC alignment pass at the original image resolution instead of the "
+            "default 2048px cap. More accurate for large or subtle displacements at the cost "
+            "of significantly increased alignment time."
+        ),
+    )
+    parser.add_argument(
         "--min-shift", type=float, default=5.0,
         help="Minimum shift magnitude in pixels before alignment is applied (default: 5.0).",
     )
@@ -664,6 +693,7 @@ def main() -> None:
             no_scale=args.no_scale,
             no_shear=args.no_shear,
             no_translation=args.no_translation,
+            full_res=args.full_res,
             min_shift=args.min_shift,
         )
         t = _snap("Align", t, checkpoints)
