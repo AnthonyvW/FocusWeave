@@ -639,6 +639,13 @@ def main() -> None:
     )
     parser.add_argument("folder", type=Path, help="Folder containing input images.")
     parser.add_argument(
+        "--output", type=Path, default=None,
+        help=(
+            "Output file path (default: stacked.jpg inside the input folder). "
+            "Format is inferred from the extension; .jpg and .jpeg use the --quality setting."
+        ),
+    )
+    parser.add_argument(
         "--no-align", action="store_true",
         help="Skip ECC alignment (use when images are already registered).",
     )
@@ -662,7 +669,7 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--reference", type=int, default=0,
+        "--reference", type=int, default=-1,
         help=(
             "Index of the image to use as the alignment reference (default: 0, i.e. the first image). "
             "All other images are aligned so that this image receives an identity warp. "
@@ -769,7 +776,8 @@ def main() -> None:
     t = _snap("Load", t, checkpoints)
 
     n_images = len(src_paths)
-    if not (0 <= args.reference < n_images):
+    reference = args.reference if args.reference >= 0 else n_images // 2
+    if not (0 <= reference < n_images):
         print(f"Error: --reference {args.reference} is out of range (0\u2013{n_images - 1}).")
         sys.exit(1)
 
@@ -780,11 +788,11 @@ def main() -> None:
     identity = np.eye(2, 3, dtype=np.float32)
     if not args.no_align:
         strategy = "global" if args.global_align else "neighbour-chained"
-        print(f"Aligning (ECC affine, {strategy}, reference image {args.reference + 1})...")
+        print(f"Aligning (ECC affine, {strategy}, reference image {reference + 1})...")
         warps = align_images(
             src_paths,
             reference_size,
-            reference_idx=args.reference,
+            reference_idx=reference,
             global_align=args.global_align,
             no_rotation=args.no_rotation,
             no_scale=args.no_scale,
@@ -803,8 +811,11 @@ def main() -> None:
     result = stack_images(src_paths, warps, levels, args.sharpness, args.dark_threshold, canvas_size, args.no_fill, args.workers)
     t = _snap("Stack", t, checkpoints)
 
-    out_path = args.folder / "stacked.jpg"
-    Image.fromarray(result).save(out_path, "JPEG", quality=args.quality)
+    out_path = args.output if args.output is not None else args.folder / "stacked.jpg"
+    fmt = out_path.suffix.lower().lstrip(".")
+    fmt = "jpeg" if fmt in ("jpg", "jpeg") else fmt.upper()
+    save_kwargs: dict = {"quality": args.quality} if fmt == "jpeg" else {}
+    Image.fromarray(result).save(out_path, fmt, **save_kwargs)
     t = _snap("Save", t, checkpoints)
 
     tracemalloc.stop()
