@@ -132,10 +132,61 @@ def _run_ecc(ref_gray: np.ndarray, src_gray: np.ndarray) -> tuple[np.ndarray, bo
     return warp, True
 
 
-def _report_warp(label: str, warp: np.ndarray) -> None:
+def _report_warp(label: str, warp: np.ndarray, no_rotation: bool = False) -> None:
     angle = np.degrees(np.arctan2(warp[1, 0], warp[0, 0]))
     tx, ty = warp[0, 2], warp[1, 2]
     print(f"  {label}: rotation {angle:+.2f}°  shift ({ty:+.1f}, {tx:+.1f}) px")
+
+
+def _constrain_warp(
+    warp: np.ndarray,
+    no_rotation: bool,
+    no_scale: bool,
+    no_shear: bool,
+    no_translation: bool,
+) -> np.ndarray:
+    """Suppress selected degrees of freedom from a 2x3 affine warp.
+
+    The linear part M is decomposed via polar decomposition M = R @ S, where R
+    is a pure rotation (det = +1) and S is a symmetric matrix encoding scale and
+    shear. S is further factored via SVD as Vt.T @ diag(sv) @ Vt.
+
+    Each flag suppresses one component before recomposing:
+
+      no_rotation — drop R  (result is S alone: Vt.T @ diag(sv) @ Vt)
+      no_scale    — normalize sv to geometric mean 1 (removes zoom, keeps R and shear)
+      no_shear    — drop Vt from S (result is R @ diag(sv): rotation + axis-aligned scale)
+      no_translation — zero warp[:, 2]
+
+    Any combination is valid. All four flags together collapse the warp to identity.
+    """
+    if not (no_rotation or no_scale or no_shear or no_translation):
+        return warp
+    result = warp.copy()
+    if no_rotation or no_scale or no_shear:
+        M = warp[:, :2].astype(np.float64)
+        U, sv, Vt = np.linalg.svd(M)
+        # SVD may produce det(U)*det(Vt) = -1, encoding a reflection. Fix by
+        # flipping the last column of U and last row of Vt (and negating that
+        # singular value) so that R = U @ Vt has det = +1.
+        if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+            U[:, -1] *= -1
+            sv[-1] *= -1
+        R = U @ Vt  # pure rotation, det = +1
+        if no_scale:
+            geomean = np.sqrt(abs(sv[0] * sv[1]))
+            sv = sv / (geomean if geomean > 1e-10 else 1.0)
+        if no_rotation and no_shear:
+            result[:, :2] = np.diag(sv)
+        elif no_rotation:
+            result[:, :2] = Vt.T * sv @ Vt  # S = Vt.T @ diag(sv) @ Vt
+        elif no_shear:
+            result[:, :2] = R @ np.diag(sv)
+        else:
+            result[:, :2] = (U * sv) @ Vt  # full recompose with modified sv
+    if no_translation:
+        result[:, 2] = 0.0
+    return result.astype(np.float32)
 
 
 def align_images(
@@ -143,6 +194,10 @@ def align_images(
     reference_size: tuple[int, int],
     reference_idx: int = 0,
     global_align: bool = False,
+    no_rotation: bool = False,
+    no_scale: bool = False,
+    no_shear: bool = False,
+    no_translation: bool = False,
     min_shift: float = 5.0,
 ) -> list[np.ndarray]:
     """Compute affine warps for all images relative to reference_idx.
@@ -157,6 +212,10 @@ def align_images(
     Global (global_align=True): every image is aligned directly to the reference
     grayscale. No chaining — each warp is the raw ECC result. More robust when
     images are not ordered by similarity, but more sensitive to large displacements.
+
+    no_rotation, no_scale, no_shear, and no_translation constrain each per-step
+    ECC warp before it is chained or used, so the constraints compose correctly
+    through the chain. See _constrain_warp for decomposition details.
 
     In both modes the reference image always receives an identity warp, and
     images whose cumulative transform is negligible (below min_shift with no
@@ -177,6 +236,12 @@ def align_images(
         linear_is_identity = np.allclose(warp[:, :2], np.eye(2), atol=1e-3)
         return translation < min_shift and linear_is_identity
 
+    def _constrain(warp: np.ndarray) -> np.ndarray:
+        return _constrain_warp(warp, no_rotation, no_scale, no_shear, no_translation)
+
+    def _report(label: str, warp: np.ndarray) -> None:
+        _report_warp(label, warp, no_rotation)
+
     ref_gray = _load_raw_gray(src_paths[reference_idx])
     warps: list[np.ndarray] = [identity.copy()] * n
     warps[reference_idx] = identity.copy()
@@ -187,6 +252,7 @@ def align_images(
                 continue
             src_gray = _load_raw_gray(src_paths[i])
             warp, converged = _run_ecc(ref_gray, src_gray)
+            warp = _constrain(warp)
             label = f"Image {i + 1}"
             if not converged:
                 print(f"  {label}: ECC did not converge — using identity")
@@ -195,7 +261,7 @@ def align_images(
                 print(f"  {label}: transform negligible — skipped")
                 warps[i] = identity.copy()
             else:
-                _report_warp(label, warp)
+                _report(label, warp)
                 warps[i] = warp
         return warps
 
@@ -205,18 +271,21 @@ def align_images(
     for i in range(reference_idx + 1, n):
         src_gray = _load_raw_gray(src_paths[i])
         warp, converged = _run_ecc(prev_gray, src_gray)
+        warp = _constrain(warp)
         prev_gray = src_gray
         label = f"Image {i + 1}"
         if not converged:
             print(f"  {label}: ECC did not converge — using previous transform")
             warps[i] = cumulative.copy()
             continue
-        cumulative = _chain_affines(cumulative, warp)
+        cumulative = _constrain(_chain_affines(cumulative, warp))
+        if no_rotation:
+            cumulative[:, :2] = np.eye(2)
         if _is_negligible(cumulative):
             print(f"  {label}: transform negligible — skipped")
             warps[i] = identity.copy()
         else:
-            _report_warp(label, cumulative)
+            _report(label, cumulative)
             warps[i] = cumulative.copy()
 
     # Neighbour-chained: backward pass (reference_idx -> start), warps inverted
@@ -224,21 +293,22 @@ def align_images(
     prev_gray = ref_gray
     for i in range(reference_idx - 1, -1, -1):
         src_gray = _load_raw_gray(src_paths[i])
-        # Align prev (closer to reference) -> src (further from reference),
-        # then invert so the warp maps src into the reference frame.
         warp, converged = _run_ecc(prev_gray, src_gray)
+        warp = _constrain(warp)
         prev_gray = src_gray
         label = f"Image {i + 1}"
         if not converged:
             print(f"  {label}: ECC did not converge — using previous transform")
             warps[i] = cumulative.copy()
             continue
-        cumulative = _chain_affines(cumulative, _invert_affine(warp))
+        cumulative = _constrain(_chain_affines(cumulative, _invert_affine(warp)))
+        if no_rotation:
+            cumulative[:, :2] = np.eye(2)
         if _is_negligible(cumulative):
             print(f"  {label}: transform negligible — skipped")
             warps[i] = identity.copy()
         else:
-            _report_warp(label, cumulative)
+            _report(label, cumulative)
             warps[i] = cumulative.copy()
 
     return warps
@@ -490,6 +560,35 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-rotation", action="store_true",
+        help=(
+            "Suppress pure rotation correction during alignment. "
+            "Scale and shear are still corrected unless also disabled. "
+            "Useful when camera tilt is not a factor."
+        ),
+    )
+    parser.add_argument(
+        "--no-scale", action="store_true",
+        help=(
+            "Suppress scale correction during alignment — both uniform zoom and non-uniform "
+            "per-axis scaling. Rotation and shear are still corrected unless also disabled."
+        ),
+    )
+    parser.add_argument(
+        "--no-shear", action="store_true",
+        help=(
+            "Suppress shear correction during alignment. "
+            "Rotation and scale are still corrected unless also disabled."
+        ),
+    )
+    parser.add_argument(
+        "--no-translation", action="store_true",
+        help=(
+            "Suppress translation correction during alignment — correct rotation/scale/shear only. "
+            "Useful when images are already spatially registered but may differ in orientation or zoom."
+        ),
+    )
+    parser.add_argument(
         "--min-shift", type=float, default=5.0,
         help="Minimum shift magnitude in pixels before alignment is applied (default: 5.0).",
     )
@@ -561,6 +660,10 @@ def main() -> None:
             reference_size,
             reference_idx=args.reference,
             global_align=args.global_align,
+            no_rotation=args.no_rotation,
+            no_scale=args.no_scale,
+            no_shear=args.no_shear,
+            no_translation=args.no_translation,
             min_shift=args.min_shift,
         )
         t = _snap("Align", t, checkpoints)
