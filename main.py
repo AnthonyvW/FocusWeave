@@ -405,10 +405,17 @@ def _lab_lap_pyramid(lab: np.ndarray, levels: int) -> list[np.ndarray]:
     return bands
 
 
-def _load_and_warp(path: Path, warp: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+def _load_and_warp(
+    path: Path,
+    warp: np.ndarray,
+    size: tuple[int, int],
+    border_mode: int = cv2.BORDER_REFLECT,
+) -> np.ndarray:
     """Load an image from disk, resize if needed, and apply a pre-computed affine warp.
 
     size is (w, h) as expected by cv2.warpAffine.
+    border_mode controls how regions outside the source image are filled;
+    cv2.BORDER_REFLECT (default) mirrors edge pixels, cv2.BORDER_CONSTANT fills with black.
     Returns a float32 RGB array.
     """
     img = np.array(Image.open(path).convert("RGB"), dtype=np.float32)
@@ -418,8 +425,70 @@ def _load_and_warp(path: Path, warp: np.ndarray, size: tuple[int, int]) -> np.nd
         u8 = np.clip(img, 0, 255).astype(np.uint8)
         img = cv2.warpAffine(u8, warp, size,
                              flags=cv2.INTER_CUBIC,
-                             borderMode=cv2.BORDER_REFLECT).astype(np.float32)
+                             borderMode=border_mode).astype(np.float32)
     return img
+
+
+
+def compute_canvas(
+    warps: list[np.ndarray],
+    src_size: tuple[int, int],
+    keep_size: bool = False,
+    crop: bool = False,
+) -> tuple[tuple[int, int], list[np.ndarray]]:
+    """Compute the output canvas size and adjusted warps for all images.
+
+    Default: the canvas expands to the full extent of all transformed image
+    corners. Every pixel has data from at least one image; border regions not
+    covered by all images use reflected fill from the nearest image edge.
+
+    With crop=True the canvas is further tightened to the intersection of all
+    transformed image extents — the largest rectangle covered by every image.
+    This removes all reflected-fill borders but shrinks the output.
+
+    With keep_size=True the canvas stays at src_size and warps are unchanged.
+
+    Returns (canvas_size, adjusted_warps) where canvas_size is (w, h) and each
+    adjusted warp includes a translation that maps the bounding box origin to (0,0).
+    """
+    if keep_size:
+        return src_size, warps
+
+    w, h = src_size
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
+
+    # Transform each image's corners through its warp to find coverage in canvas space
+    all_corners: list[np.ndarray] = []
+    for warp in warps:
+        M = warp.astype(np.float64)
+        transformed = (M[:, :2] @ corners.T + M[:, 2:]).T
+        all_corners.append(transformed)
+
+    all_pts = np.concatenate(all_corners, axis=0)
+    canvas_min = all_pts.min(axis=0)  # (x_min, y_min) — full extent
+    canvas_max = all_pts.max(axis=0)  # (x_max, y_max) — full extent
+
+    if crop:
+        # Shift corners into canvas space first, then find the intersection
+        per_img_mins = np.array([c.min(axis=0) for c in all_corners]) - canvas_min
+        per_img_maxs = np.array([c.max(axis=0) for c in all_corners]) - canvas_min
+        crop_min = per_img_mins.max(axis=0)  # tightest left/top edge
+        crop_max = per_img_maxs.min(axis=0)  # tightest right/bottom edge
+        if np.all(crop_max > crop_min):
+            # Express crop bounds back in original canvas space for the shift calculation
+            canvas_max = canvas_min + crop_max
+            canvas_min = canvas_min + crop_min
+
+    # Shift all warps so that canvas_min maps to (0, 0)
+    tx, ty = -canvas_min
+    shift = np.array([[1, 0, tx], [0, 1, ty]], dtype=np.float32)
+    adjusted = []
+    for warp in warps:
+        adjusted.append(_chain_affines(shift, warp.astype(np.float32)))
+
+    canvas_w = max(1, int(np.ceil(canvas_max[0] - canvas_min[0])))
+    canvas_h = max(1, int(np.ceil(canvas_max[1] - canvas_min[1])))
+    return (canvas_w, canvas_h), adjusted
 
 
 def stack_images(
@@ -428,6 +497,8 @@ def stack_images(
     levels: int,
     sharpness: float,
     dark_threshold: float,
+    canvas_size: tuple[int, int] | None = None,
+    no_fill: bool = False,
     workers: int = 3,
 ) -> np.ndarray:
     """Fuse a stack of images using single-pass unnormalized Laplacian pyramid fusion.
@@ -435,6 +506,12 @@ def stack_images(
     Accumulates energy-weighted Lab bands and energy sums in one disk read per
     image, then divides at the end. Mathematically identical to normalized fusion:
       Σ(e_k / Σe_k · x_k) = Σ(e_k · x_k) / Σe_k
+
+    canvas_size overrides the output dimensions (w, h). If None, the size of the
+    first image is used (equivalent to --keep-size behaviour).
+
+    no_fill uses BORDER_CONSTANT (black) instead of BORDER_REFLECT for regions
+    outside each image's coverage after warping.
 
     workers controls how many images are processed concurrently. Peak RAM scales
     with workers × ~100 MiB per image plus the fixed fused_lp accumulator.
@@ -444,13 +521,14 @@ def stack_images(
     img0 = np.array(Image.open(src_paths[0]).convert("RGB"), dtype=np.float32)
     h, w = img0.shape[:2]
     del img0
-    cv2_size = (w, h)
+    cv2_size = canvas_size if canvas_size is not None else (w, h)
+    border_mode = cv2.BORDER_CONSTANT if no_fill else cv2.BORDER_REFLECT
 
     n_workers = min(len(src_paths), workers if workers > 0 else (os.cpu_count() or 4))
 
     def _process_image(args: tuple[Path, np.ndarray]) -> tuple[list[np.ndarray], list[np.ndarray]]:
         path, warp = args
-        lab = _image_to_lab(_load_and_warp(path, warp, cv2_size))
+        lab = _image_to_lab(_load_and_warp(path, warp, cv2_size, border_mode))
         lap = _lab_lap_pyramid(lab, levels)
         del lab
         energies: list[np.ndarray] = []
@@ -563,6 +641,25 @@ def main() -> None:
     parser.add_argument(
         "--no-align", action="store_true",
         help="Skip ECC alignment (use when images are already registered).",
+    )
+    parser.add_argument(
+        "--keep-size", action="store_true",
+        help="Keep the output image the same size as the input images. Warps are applied in-place.",
+    )
+    parser.add_argument(
+        "--crop", action="store_true",
+        help=(
+            "Crop the output to the intersection of all transformed image extents — the largest "
+            "rectangle covered by every image. Removes all border regions but shrinks "
+            "the output relative to the default expanded canvas."
+        ),
+    )
+    parser.add_argument(
+        "--no-fill", action="store_true",
+        help=(
+            "Fill border regions outside each image's coverage with black instead of "
+            "reflecting edge pixels. Pairs naturally with --crop to trim the black borders away."
+        ),
     )
     parser.add_argument(
         "--reference", type=int, default=0,
@@ -702,7 +799,8 @@ def main() -> None:
         warps = [identity.copy() for _ in src_paths]
 
     print("Stacking...")
-    result = stack_images(src_paths, warps, levels, args.sharpness, args.dark_threshold, args.workers)
+    canvas_size, warps = compute_canvas(warps, reference_size, keep_size=args.keep_size, crop=args.crop)
+    result = stack_images(src_paths, warps, levels, args.sharpness, args.dark_threshold, canvas_size, args.no_fill, args.workers)
     t = _snap("Stack", t, checkpoints)
 
     out_path = args.folder / "stacked.jpg"
