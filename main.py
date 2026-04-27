@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import tracemalloc
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
 
 import cv2
 import numpy as np
@@ -406,19 +406,22 @@ def _lab_lap_pyramid(lab: np.ndarray, levels: int) -> list[np.ndarray]:
 
 
 def _load_and_warp(
-    path: Path,
+    path: Path | np.ndarray,
     warp: np.ndarray,
     size: tuple[int, int],
     border_mode: int = cv2.BORDER_REFLECT,
 ) -> np.ndarray:
-    """Load an image from disk, resize if needed, and apply a pre-computed affine warp.
+    """Load an image (or use an already-loaded array), resize if needed, and apply a warp.
 
     size is (w, h) as expected by cv2.warpAffine.
     border_mode controls how regions outside the source image are filled;
     cv2.BORDER_REFLECT (default) mirrors edge pixels, cv2.BORDER_CONSTANT fills with black.
     Returns a float32 RGB array.
     """
-    img = np.array(Image.open(path).convert("RGB"), dtype=np.float32)
+    if isinstance(path, np.ndarray):
+        img = path.astype(np.float32)
+    else:
+        img = np.array(Image.open(path).convert("RGB"), dtype=np.float32)
     if img.shape[1] != size[0] or img.shape[0] != size[1]:
         img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
     if not np.array_equal(warp, np.eye(2, 3, dtype=np.float32)):
@@ -492,7 +495,7 @@ def compute_canvas(
 
 
 def stack_images(
-    src_paths: list[Path],
+    src_paths: list[Path | np.ndarray],
     warps: list[np.ndarray],
     levels: int,
     sharpness: float,
@@ -518,15 +521,18 @@ def stack_images(
     Default of 3 workers balances speed and memory for most systems.
     """
 
-    img0 = np.array(Image.open(src_paths[0]).convert("RGB"), dtype=np.float32)
-    h, w = img0.shape[:2]
-    del img0
+    if isinstance(src_paths[0], np.ndarray):
+        h, w = src_paths[0].shape[:2]
+    else:
+        img0 = np.array(Image.open(src_paths[0]).convert("RGB"), dtype=np.float32)
+        h, w = img0.shape[:2]
+        del img0
     cv2_size = canvas_size if canvas_size is not None else (w, h)
     border_mode = cv2.BORDER_CONSTANT if no_fill else cv2.BORDER_REFLECT
 
     n_workers = min(len(src_paths), workers if workers > 0 else (os.cpu_count() or 4))
 
-    def _process_image(args: tuple[Path, np.ndarray]) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    def _process_image(args: tuple[Path | np.ndarray, np.ndarray]) -> tuple[list[np.ndarray], list[np.ndarray]]:
         path, warp = args
         lab = _image_to_lab(_load_and_warp(path, warp, cv2_size, border_mode))
         lap = _lab_lap_pyramid(lab, levels)
@@ -631,6 +637,124 @@ def compute_levels(shape: tuple[int, int], max_levels: int = 6) -> int:
         size //= 2
         levels += 1
     return levels
+
+
+def _save_image(img: np.ndarray, path: Path, quality: int) -> None:
+    fmt = path.suffix.lower().lstrip(".")
+    fmt = "jpeg" if fmt in ("jpg", "jpeg") else fmt.upper()
+    save_kwargs: dict = {"quality": quality} if fmt == "jpeg" else {}
+    Image.fromarray(img).save(path, fmt, **save_kwargs)
+
+
+def _compute_slabs(n: int, slab_size: int, overlap: int) -> list[tuple[int, int]]:
+    """Return (start, end) index pairs for a list of n items."""
+    step = max(1, slab_size - overlap)
+    slabs: list[tuple[int, int]] = []
+    for s in range(0, n, step):
+        end = min(s + slab_size, n)
+        slabs.append((s, end))
+        if end == n:
+            break
+    return slabs
+
+
+def slab_images(
+    src_paths: list[Path],
+    adjusted_warps: list[np.ndarray],
+    slab_size: int,
+    overlap: int,
+    levels: int,
+    sharpness: float,
+    dark_threshold: float,
+    canvas_size: tuple[int, int],
+    no_fill: bool,
+    workers: int,
+    output_steps: bool,
+    steps_dir: Path | None,
+    quality: int,
+    only_slab: bool,
+    recursive: bool,
+    final_extension: str,
+) -> list[Path] | np.ndarray:
+    """Stack images using slabbing, optionally recursive.
+
+    Layer 1 splits src_paths into overlapping sub-stacks and stacks each one.
+    With recursive=True, if the layer-1 results still outnumber slab_size the
+    same split is applied to those results as layer 2, and so on, until the
+    remaining count fits within a single stack pass.
+    With recursive=False, the layer-1 results are fused in one final stack
+    regardless of how many there are.
+
+    With only_slab=True recursion is ignored: layer 1 slabs are saved (if
+    output_steps) and the function returns immediately so the user can touch
+    up the intermediates before a manual final stack.
+
+    With output_steps=True each layer's slab results are saved to steps_dir
+    using the naming scheme slab_<layer>_<NNN>.<ext>.
+    """
+    identity = np.eye(2, 3, dtype=np.float32)
+    final_ext = final_extension.lstrip(".")
+
+    # current_items holds either the original source Paths (layer 1) or
+    # stacked result arrays from the previous layer (layer 2+).
+    current_items: list[Path | np.ndarray] = list(src_paths)
+    current_warps: list[np.ndarray] = list(adjusted_warps)
+    current_canvas: tuple[int, int] = canvas_size
+
+    layer = 1
+    while True:
+        n = len(current_items)
+        slabs = _compute_slabs(n, slab_size, overlap)
+
+        indent = "  " * layer
+        print(f"{indent}Layer {layer}: {len(slabs)} slabs of up to {slab_size} from {n} images, {overlap} overlap")
+
+        slab_paths: list[Path] = []
+        slab_arrays: list[np.ndarray] = []
+
+        for idx, (start, end) in enumerate(slabs):
+            label = f"slab_{layer}_{idx + 1:03d}"
+            print(f"{indent}  Stacking {label} (images {start + 1}-{end})...")
+            result = stack_images(
+                current_items[start:end], current_warps[start:end],
+                levels, sharpness, dark_threshold, current_canvas, no_fill, workers,
+            )
+
+            if output_steps and steps_dir is not None:
+                slab_file = steps_dir / f"{label}.{final_ext}"
+                _save_image(result, slab_file, quality)
+                print(f"{indent}    Saved: {slab_file}")
+                slab_paths.append(slab_file)
+
+            slab_arrays.append(result)
+
+        # --only-slab: stop after the first layer regardless of how many slabs
+        # were produced, so the user can inspect and manually edit them.
+        if only_slab:
+            if not output_steps or steps_dir is None:
+                print("Warning: --only-slab used without --output-steps; slab images were not saved to disk.")
+            return slab_paths
+
+        # If this layer produced only one slab, that result is the final image.
+        if len(slab_arrays) == 1:
+            return slab_arrays[0]
+
+        # If all slabs fit in one more pass, or recursion is disabled,
+        # fuse the slab arrays directly without writing anything to disk.
+        if len(slab_arrays) <= slab_size or not recursive:
+            print(f"{indent}  Final stack: merging {len(slab_arrays)} slab results...")
+            final_warps = [identity.copy() for _ in slab_arrays]
+            return stack_images(
+                slab_arrays, final_warps, levels, sharpness, dark_threshold,
+                current_canvas, no_fill, workers,
+            )
+
+        # recursive=True and still too many results: loop into the next layer
+        # passing the arrays directly — no disk writes needed.
+        current_items = list(slab_arrays)
+        current_warps = [identity.copy() for _ in slab_arrays]
+        current_canvas = canvas_size
+        layer += 1
 
 
 def main() -> None:
@@ -760,6 +884,46 @@ def main() -> None:
             "Set to 0 to use all CPU cores."
         ),
     )
+    parser.add_argument(
+        "--slab", type=int, nargs=2, metavar=("SIZE", "OVERLAP"), default=None,
+        help=(
+            "Enable slabbing: split the aligned image set into overlapping sub-stacks, "
+            "stack each independently, then fuse the slab results. "
+            "SIZE is the number of images per sub-stack; OVERLAP is how many images "
+            "adjacent slabs share. Example: --slab 20 5"
+        ),
+    )
+    parser.add_argument(
+        "--output-steps", action="store_true",
+        help=(
+            "Save each intermediate slab result into a 'focusweave_slabs' folder "
+            "inside the output directory. Requires --slab."
+        ),
+    )
+    parser.add_argument(
+        "--only-slab", action="store_true",
+        help=(
+            "Stop after producing slabs; do not fuse them into a final image. "
+            "Requires --slab. Implies --output-steps."
+        ),
+    )
+    parser.add_argument(
+        "--recursive-slab", action="store_true",
+        help=(
+            "Enable recursive slabbing: if the layer-1 slab results still outnumber "
+            "the slab SIZE, apply slabbing again to those results as layer 2, and so "
+            "on, until the count fits in a single stack pass. Without this flag the "
+            "layer-1 results are fused in one final stack regardless of count. "
+            "Ignored when --only-slab is used."
+        ),
+    )
+    parser.add_argument(
+        "--slab-format", type=str, default=None, metavar="EXT",
+        help=(
+            "File format for images saved to focusweave_slabs/ (e.g. tiff, png, jpg). "
+            "Defaults to tiff when not specified. Requires --output-steps or --only-slab."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.folder.is_dir():
@@ -806,16 +970,65 @@ def main() -> None:
         print("Skipping alignment.")
         warps = [identity.copy() for _ in src_paths]
 
-    print("Stacking...")
-    canvas_size, warps = compute_canvas(warps, reference_size, keep_size=args.keep_size, crop=args.crop)
-    result = stack_images(src_paths, warps, levels, args.sharpness, args.dark_threshold, canvas_size, args.no_fill, args.workers)
-    t = _snap("Stack", t, checkpoints)
+    use_slabs = args.slab is not None
+    only_slab = args.only_slab
+    output_steps = args.output_steps or only_slab
 
     out_path = args.output if args.output is not None else args.folder / "stacked.jpg"
-    fmt = out_path.suffix.lower().lstrip(".")
-    fmt = "jpeg" if fmt in ("jpg", "jpeg") else fmt.upper()
-    save_kwargs: dict = {"quality": args.quality} if fmt == "jpeg" else {}
-    Image.fromarray(result).save(out_path, fmt, **save_kwargs)
+
+    out_extension = out_path.suffix.lower().lstrip(".")
+
+    canvas_size, adjusted_warps = compute_canvas(warps, reference_size, keep_size=args.keep_size, crop=args.crop)
+
+    if use_slabs:
+        slab_size, overlap = args.slab
+        if slab_size < 2:
+            print("Error: slab SIZE must be at least 2.")
+            sys.exit(1)
+        if overlap < 0 or overlap >= slab_size:
+            print(f"Error: slab OVERLAP must be >= 0 and < SIZE ({slab_size}).")
+            sys.exit(1)
+
+        steps_dir: Path | None = None
+        if output_steps:
+            steps_dir = out_path.parent / "focusweave_slabs"
+            steps_dir.mkdir(parents=True, exist_ok=True)
+
+        print("Slabbing...")
+        slab_result = slab_images(
+            src_paths=src_paths,
+            adjusted_warps=adjusted_warps,
+            slab_size=slab_size,
+            overlap=overlap,
+            levels=levels,
+            sharpness=args.sharpness,
+            dark_threshold=args.dark_threshold,
+            canvas_size=canvas_size,
+            no_fill=args.no_fill,
+            workers=args.workers,
+            output_steps=output_steps,
+            steps_dir=steps_dir,
+            quality=args.quality,
+            only_slab=only_slab,
+            recursive=args.recursive_slab and not only_slab,
+            final_extension=args.slab_format.lstrip(".") if args.slab_format else "tiff",
+        )
+        t = _snap("Slab", t, checkpoints)
+
+        if only_slab:
+            tracemalloc.stop()
+            if steps_dir is not None:
+                print(f"Slabs saved to: {steps_dir}")
+            _print_report(checkpoints, time.perf_counter() - t_total)
+            return
+
+        result = slab_result  # type: ignore[assignment]
+    else:
+        print("Stacking...")
+        result = stack_images(src_paths, adjusted_warps, levels, args.sharpness, args.dark_threshold, canvas_size, args.no_fill, args.workers)
+        t = _snap("Stack", t, checkpoints)
+
+    _save_image(result, out_path, args.quality)  # type: ignore[arg-type]
     t = _snap("Save", t, checkpoints)
 
     tracemalloc.stop()
