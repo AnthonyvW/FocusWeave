@@ -13,11 +13,16 @@ jobs:
           - os: windows-latest
             artifact_name: FocusWeave-windows
             built_path: dist/FocusWeave.exe
+            release_name: FocusWeave-windows.exe
           - os: ubuntu-latest
             artifact_name: FocusWeave-linux
             built_path: dist/FocusWeave
+            release_name: FocusWeave-linux
 
     runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -36,15 +41,17 @@ jobs:
       - name: Build executable
         run: pyinstaller focusweave.spec
 
+      - name: Rename artifact for release
+        run: mv ${{ matrix.built_path }} dist/${{ matrix.release_name }}
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
         with:
-          files: ${{ matrix.built_path }}
-          asset_name: ${{ matrix.artifact_name }}
+          files: dist/${{ matrix.release_name }}
 
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.built_path }}
+          path: dist/${{ matrix.release_name }}
