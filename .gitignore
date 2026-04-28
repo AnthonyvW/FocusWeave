@@ -1,7 +1,6 @@
-depth.png
 *.tiff
-focus_scores/*
 *.jpg
 *.png
 venv/
 __pycache__/
+focusweave.egg-info/
