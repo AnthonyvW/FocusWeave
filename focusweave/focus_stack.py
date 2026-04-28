@@ -384,11 +384,6 @@ def _chain_affines(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return (a3 @ b3)[:2]
 
 
-def _invert_affine(warp: np.ndarray) -> np.ndarray:
-    m3 = np.vstack([warp, [0.0, 0.0, 1.0]])
-    return np.linalg.inv(m3)[:2]
-
-
 def _validate_warp(
     warp: np.ndarray,
     seed_warp: np.ndarray,
