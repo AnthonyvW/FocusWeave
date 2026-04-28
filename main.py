@@ -18,7 +18,7 @@ def save_image(img: np.ndarray, path: Path, quality: int) -> None:
     Image.fromarray(img).save(path, fmt, **save_kwargs)
 
 
-def _progress(fraction: float, message: str) -> None:
+def _progress(fraction: float, stage: str, message: str) -> None:
     if message:
         print(f"  {fraction * 100:5.1f}%  {message}")
 
@@ -247,6 +247,7 @@ def main() -> None:
     )
 
     try:
+        t_start = time.perf_counter()
         result = run(cfg, progress=_progress)
     except Interrupted:
         print("\nInterrupted.")
@@ -255,16 +256,16 @@ def main() -> None:
         print(f"Error: {e}")
         sys.exit(1)
 
-    print(result.stats.format_report())
-
     if result.slabs is not None:
         if steps_dir is not None:
             print(f"Slabs saved to: {steps_dir}")
+        print(f"Done ({time.perf_counter() - t_start:.2f}s total)")
         return
 
     t_save = time.perf_counter()
     save_image(result.image, out_path, args.quality)  # type: ignore[arg-type]
     print(f"Saved: {out_path} ({time.perf_counter() - t_save:.2f}s)")
+    print(f"Done ({time.perf_counter() - t_start:.2f}s total)")
 
 
 if __name__ == "__main__":

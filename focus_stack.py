@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import os
-import time
-import tracemalloc
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -18,7 +17,9 @@ KERNEL_1D = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16.0
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
-ProgressCallback = Callable[[float, str], None]
+Stage = Literal["loading", "culling", "aligning", "stacking", "slabbing", "complete"]
+
+ProgressCallback = Callable[[float, Stage, str], None]
 SlabCallback = Callable[[str, np.ndarray], None]
 InterruptCallback = Callable[[], bool]
 
@@ -46,39 +47,9 @@ class CullResult:
 
 
 @dataclass
-class StepStats:
-    name: str
-    elapsed: float
-    current_mib: float
-    peak_mib: float
-
-
-@dataclass
-class RunStats:
-    steps: list[StepStats]
-    total_elapsed: float
-
-    def format_report(self) -> str:
-        name_w = max(len(s.name) for s in self.steps)
-        header = f"  {'Step':<{name_w}}  {'Time':>8}  {'Current MiB':>12}  {'Peak MiB':>10}"
-        sep = "  " + "-" * (len(header) - 2)
-        rows = [
-            f"  {s.name:<{name_w}}  {s.elapsed:>7.2f}s  {s.current_mib:>11.1f}  {s.peak_mib:>9.1f}"
-            for s in self.steps
-        ]
-        total = f"  {'Total':<{name_w}}  {self.total_elapsed:>7.2f}s"
-        return "\n".join(["", header, sep, *rows, sep, total])
-
-
-@dataclass
 class RunResult:
     image: np.ndarray | None
     slabs: list[np.ndarray] | None
-    stats: RunStats
-
-
-def _elapsed(start: float) -> str:
-    return f"{time.perf_counter() - start:.2f}s"
 
 
 def load_images(folder: Path) -> tuple[list[Path], tuple[int, int]]:
@@ -199,7 +170,7 @@ def _compute_all_score_maps(
 
     Returns (score_maps, scores).
 
-    progress is called as progress(fraction, message) after each image.
+    progress is called as progress(fraction, stage, message) after each image.
     """
     maps: list[np.ndarray] = []
     scores: list[float] = []
@@ -212,7 +183,7 @@ def _compute_all_score_maps(
         scores.append(score)
         if progress is not None:
             label = img.name if isinstance(img, Path) else f"image_{i}"
-            progress((i + 1) / n, f"Scored {label}  ({score:.4f})")
+            progress((i + 1) / n, "culling", f"Scored {label}  ({score:.4f})")
     return maps, scores
 
 
@@ -231,7 +202,7 @@ def cull_unfocused_images(
     At least the two sharpest frames are always retained so the stack can
     proceed even when threshold is set very high.
 
-    progress is called as progress(fraction, message) after each image.
+    progress is called as progress(fraction, stage, message) after each image.
 
     Raises ValueError if fewer than 2 images survive (guards against degenerate
     inputs where the safety floor itself cannot produce 2 valid frames).
@@ -608,7 +579,7 @@ def align_images(
     images whose cumulative transform is negligible (below min_shift with no
     meaningful rotation/scale) are assigned identity.
 
-    progress is called as progress(fraction, message) after each image is aligned,
+    progress is called as progress(fraction, stage, message) after each image is aligned,
     where fraction is in [0, 1] relative to the total number of non-reference images.
     The message describes the alignment result for that image.
 
@@ -638,7 +609,7 @@ def align_images(
 
     def _notify(done: int, message: str) -> None:
         if progress is not None:
-            progress(done / max(n_to_align, 1), message)
+            progress(done / max(n_to_align, 1), "aligning", message)
         if interrupt is not None and interrupt():
             raise Interrupted
 
@@ -915,7 +886,7 @@ def stack_images(
     with workers × ~100 MiB per image plus the fixed fused_lp accumulator.
     Default of 3 workers balances speed and memory for most systems.
 
-    progress is called as progress(fraction, message) after each image is fused
+    progress is called as progress(fraction, stage, message) after each image is fused
     and at each subsequent stage. fraction runs from 0 to 1 across the full
     stack_images call: ~0–0.7 fusing, 0.8 reconstructing, 0.9 colour correction,
     1.0 complete.
@@ -947,7 +918,7 @@ def stack_images(
         return energies, lap
 
     if progress is not None:
-        progress(0.0, f"Fusing ({n_workers} workers)...")
+        progress(0.0, "stacking", f"Fusing ({n_workers} workers)...")
     energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
     fused_lp: list[np.ndarray | None] = [None] * (levels + 1)
     weighted_buf: np.ndarray | None = None
@@ -989,7 +960,7 @@ def stack_images(
 
             fused += 1
             if progress is not None:
-                progress(fused / n * 0.7, f"Fused image {fused}/{n}")
+                progress(fused / n * 0.7, "stacking", f"Fused image {fused}/{n}")
             if interrupt is not None and interrupt():
                 raise Interrupted
 
@@ -997,7 +968,7 @@ def stack_images(
         fused_lp[i] /= energy_sums[i][:, :, np.newaxis] + 1e-10  # type: ignore[operator,index]
 
     if progress is not None:
-        progress(0.8, "Reconstructing pyramid...")
+        progress(0.8, "stacking", "Reconstructing pyramid...")
     image = fused_lp[-1].copy()  # type: ignore[union-attr]
     for band in reversed(fused_lp[:-1]):
         cur_shape = band.shape[:2]  # type: ignore[union-attr]
@@ -1006,12 +977,12 @@ def stack_images(
     fused_lab = image
 
     if progress is not None:
-        progress(0.9, "Colour correction...")
+        progress(0.9, "stacking", "Colour correction...")
     fused_lab = _suppress_dark_chroma(fused_lab, dark_threshold)
     result = cv2.cvtColor(np.clip(fused_lab, 0, 255).astype(np.uint8), cv2.COLOR_Lab2RGB)
 
     if progress is not None:
-        progress(1.0, "Stacking complete")
+        progress(1.0, "stacking", "Stacking complete")
 
     return result
 
@@ -1088,7 +1059,7 @@ def slab_images(
     caller wants to persist intermediate results. The label follows the pattern
     slab_<layer>_<NNN>. Saving is entirely the caller's responsibility.
 
-    progress is called as progress(fraction, message) after each completed slab,
+    progress is called as progress(fraction, stage, message) after each completed slab,
     where fraction advances by 1/total_slabs per slab.
 
     interrupt is called after each completed slab; if it returns True, Interrupted is raised.
@@ -1106,14 +1077,14 @@ def slab_images(
         total_slabs = len(slabs)
 
         if progress is not None:
-            progress(0.0, f"Layer {layer}: {total_slabs} slabs from {n} images")
+            progress(0.0, "slabbing", f"Layer {layer}: {total_slabs} slabs from {n} images")
 
         slab_arrays: list[np.ndarray] = []
 
         for idx, (start, end) in enumerate(slabs):
             label = f"slab_{layer}_{idx + 1:03d}"
             if progress is not None:
-                progress(idx / total_slabs, f"Stacking {label} (images {start + 1}–{end})")
+                progress(idx / total_slabs, "slabbing", f"Stacking {label} (images {start + 1}–{end})")
             result = stack_images(
                 current_items[start:end], current_warps[start:end],
                 levels, sharpness, dark_threshold, current_canvas, no_fill, workers,
@@ -1128,7 +1099,7 @@ def slab_images(
                 raise Interrupted
 
         if progress is not None:
-            progress(1.0, f"Layer {layer} complete")
+            progress(1.0, "slabbing", f"Layer {layer} complete")
 
         if only_slab:
             return slab_arrays
@@ -1176,14 +1147,6 @@ class FocusStackConfig:
     interrupt: InterruptCallback | None = None
 
 
-def _snap(name: str, step_start: float, steps: list[StepStats]) -> float:
-    now = time.perf_counter()
-    current, peak = tracemalloc.get_traced_memory()
-    steps.append(StepStats(name, now - step_start, current / 2**20, peak / 2**20))
-    tracemalloc.reset_peak()
-    return now
-
-
 def run(
     cfg: FocusStackConfig,
     progress: ProgressCallback | None = None,
@@ -1193,35 +1156,29 @@ def run(
     Returns a RunResult with:
       - image: uint8 RGB ndarray of the stacked image, or None when only_slab is True.
       - slabs: list of intermediate slab arrays when only_slab is True, else None.
-      - stats: RunStats with per-step timing and memory data.
 
-    progress is called throughout as progress(fraction, message) where fraction
-    is in [0, 1] across the whole run. The stages and their approximate weight:
+    progress is called throughout as progress(fraction, stage, message) where fraction
+    is in [0, 1] across the whole run and stage is a Stage literal indicating which
+    part of the pipeline is active. The stages and their approximate weight:
       loading ~5%   alignment ~25%   stacking ~65%
 
     Raises Interrupted if cfg.interrupt returns True at any checkpoint.
     Raises ValueError for invalid configuration (bad reference index, slab params).
     """
-    steps: list[StepStats] = []
-    t_total = time.perf_counter()
-    tracemalloc.start()
-    t = t_total
-
-    def _stage(fraction: float, message: str) -> None:
+    def _stage(fraction: float, stage: Stage, message: str) -> None:
         if progress is not None:
-            progress(fraction, message)
+            progress(fraction, stage, message)
 
-    _stage(0.0, "Loading images...")
+    _stage(0.0, "loading", "Loading images...")
     src_images, reference_size = resolve_images(cfg.images)
     n_images = len(src_images)
-    t = _snap("Load", t, steps)
 
     if cfg.cull is not None:
-        _stage(0.02, "Culling unfocused images...")
+        _stage(0.02, "culling", "Culling unfocused images...")
 
-        def _cull_progress(fraction: float, message: str) -> None:
+        def _cull_progress(fraction: float, stage: Stage, message: str) -> None:
             if progress is not None:
-                progress(0.02 + fraction * 0.03, message)
+                progress(0.02 + fraction * 0.03, stage, message)
 
         cull_result = cull_unfocused_images(
             src_images,
@@ -1232,11 +1189,10 @@ def run(
         for i, entry in enumerate(cull_result.entries):
             status = "keep" if entry.kept else "CULL"
             label = entry.path.name if isinstance(entry.path, Path) else f"image_{i}"
-            _stage(0.02, f"  [{status}] {label}  (score={entry.score:.4g}, cutoff={cull_result.cutoff:.4g})")
-        _stage(0.05, f"Culled {cull_result.n_culled}/{len(cull_result.entries)} image(s); {len(cull_result.kept)} frame(s) remaining.")
+            _stage(0.02, "culling", f"  [{status}] {label}  (score={entry.score:.4g}, cutoff={cull_result.cutoff:.4g})")
+        _stage(0.05, "culling", f"Culled {cull_result.n_culled}/{len(cull_result.entries)} image(s); {len(cull_result.kept)} frame(s) remaining.")
         src_images = cull_result.kept
         n_images = len(src_images)
-        t = _snap("Cull", t, steps)
 
     if cfg.reference >= 0:
         reference = cfg.reference
@@ -1251,11 +1207,11 @@ def run(
     identity = np.eye(2, 3, dtype=np.float32)
     if not cfg.no_align:
         strategy = "global" if cfg.global_align else "neighbour-chained"
-        _stage(0.08, f"Aligning ({strategy}, reference image {reference + 1})...")
+        _stage(0.08, "aligning", f"Aligning ({strategy}, reference image {reference + 1})...")
 
-        def _align_progress(fraction: float, message: str) -> None:
+        def _align_progress(fraction: float, stage: Stage, message: str) -> None:
             if progress is not None:
-                progress(0.08 + fraction * 0.22, message)
+                progress(0.08 + fraction * 0.22, stage, message)
 
         warps = align_images(
             src_images,
@@ -1271,9 +1227,8 @@ def run(
             progress=_align_progress,
             interrupt=cfg.interrupt,
         )
-        t = _snap("Align", t, steps)
     else:
-        _stage(0.08, "Skipping alignment.")
+        _stage(0.08, "aligning", "Skipping alignment.")
         warps = [identity.copy() for _ in src_images]
 
     use_slabs = cfg.slab is not None
@@ -1281,9 +1236,9 @@ def run(
 
     canvas_size, adjusted_warps = compute_canvas(warps, reference_size, keep_size=cfg.keep_size, crop=cfg.crop)
 
-    def _stack_progress(fraction: float, message: str) -> None:
+    def _stack_progress(fraction: float, stage: Stage, message: str) -> None:
         if progress is not None:
-            progress(0.30 + fraction * 0.65, message)
+            progress(0.30 + fraction * 0.65, stage, message)
 
     if use_slabs:
         slab_size, overlap = cfg.slab  # type: ignore[misc]
@@ -1292,7 +1247,7 @@ def run(
         if overlap < 0 or overlap >= slab_size:
             raise ValueError(f"Slab OVERLAP must be >= 0 and < SIZE ({slab_size}).")
 
-        _stage(0.30, "Slabbing...")
+        _stage(0.30, "slabbing", "Slabbing...")
         slab_result = slab_images(
             src_paths=src_images,
             adjusted_warps=adjusted_warps,
@@ -1310,25 +1265,17 @@ def run(
             progress=_stack_progress,
             interrupt=cfg.interrupt,
         )
-        t = _snap("Slab", t, steps)
-
-        tracemalloc.stop()
-        stats = RunStats(steps=steps, total_elapsed=time.perf_counter() - t_total)
-        _stage(1.0, "Complete")
+        _stage(1.0, "complete", "Complete")
 
         if only_slab:
-            return RunResult(image=None, slabs=slab_result, stats=stats)  # type: ignore[arg-type]
+            return RunResult(image=None, slabs=slab_result)  # type: ignore[arg-type]
 
-        return RunResult(image=slab_result, slabs=None, stats=stats)  # type: ignore[arg-type]
+        return RunResult(image=slab_result, slabs=None)  # type: ignore[arg-type]
 
-    _stage(0.30, "Stacking...")
+    _stage(0.30, "stacking", "Stacking...")
     result = stack_images(
         src_images, adjusted_warps, levels, cfg.sharpness, cfg.dark_threshold,
         canvas_size, cfg.no_fill, cfg.workers, _stack_progress, cfg.interrupt,
     )
-    t = _snap("Stack", t, steps)
-
-    tracemalloc.stop()
-    stats = RunStats(steps=steps, total_elapsed=time.perf_counter() - t_total)
-    _stage(1.0, "Complete")
-    return RunResult(image=result, slabs=None, stats=stats)
+    _stage(1.0, "complete", "Complete")
+    return RunResult(image=result, slabs=None)

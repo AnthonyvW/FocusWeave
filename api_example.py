@@ -62,17 +62,18 @@ def stack(
         on_slab=_on_slab if emit_steps else None,
     )
 
+    t_start = time.perf_counter()
     result = run(cfg)
-    print(result.stats.format_report())
-
     if result.slabs is not None:
         if steps_dir is not None:
             print(f"Slabs saved to: {steps_dir}")
+        print(f"Done ({time.perf_counter() - t_start:.2f}s total)")
         return result
 
     t_save = time.perf_counter()
     save_image(result.image, out_path, quality)  # type: ignore[arg-type]
     print(f"Saved: {out_path} ({time.perf_counter() - t_save:.2f}s)")
+    print(f"Done ({time.perf_counter() - t_start:.2f}s total)")
 
     return result
 
