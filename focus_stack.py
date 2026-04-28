@@ -27,6 +27,56 @@ class Interrupted(Exception):
     """Raised when an interrupt callback signals that the run should stop."""
 
 
+@dataclass
+class CullEntry:
+    path: Path
+    score: float
+    kept: bool
+
+
+@dataclass
+class CullResult:
+    entries: list[CullEntry]
+    cutoff: float
+    n_culled: int
+
+    @property
+    def kept(self) -> list[Path]:
+        return [e.path for e in self.entries if e.kept]
+
+
+@dataclass
+class StepStats:
+    name: str
+    elapsed: float
+    current_mib: float
+    peak_mib: float
+
+
+@dataclass
+class RunStats:
+    steps: list[StepStats]
+    total_elapsed: float
+
+    def format_report(self) -> str:
+        name_w = max(len(s.name) for s in self.steps)
+        header = f"  {'Step':<{name_w}}  {'Time':>8}  {'Current MiB':>12}  {'Peak MiB':>10}"
+        sep = "  " + "-" * (len(header) - 2)
+        rows = [
+            f"  {s.name:<{name_w}}  {s.elapsed:>7.2f}s  {s.current_mib:>11.1f}  {s.peak_mib:>9.1f}"
+            for s in self.steps
+        ]
+        total = f"  {'Total':<{name_w}}  {self.total_elapsed:>7.2f}s"
+        return "\n".join(["", header, sep, *rows, sep, total])
+
+
+@dataclass
+class RunResult:
+    image: np.ndarray | None
+    slabs: list[np.ndarray] | None
+    stats: RunStats
+
+
 def _elapsed(start: float) -> str:
     return f"{time.perf_counter() - start:.2f}s"
 
@@ -133,7 +183,7 @@ def cull_unfocused_images(
     reference_size: tuple[int, int],
     threshold: float = 0.05,
     progress: ProgressCallback | None = None,
-) -> list[Path]:
+) -> CullResult:
     """Remove images whose focus score falls below threshold × peak score.
 
     Each image is scored by the HF/LF ratio of its Tenengrad score map
@@ -153,7 +203,8 @@ def cull_unfocused_images(
 
     peak = max(scores)
     if peak == 0.0:
-        return paths
+        entries = [CullEntry(path=p, score=s, kept=True) for p, s in zip(paths, scores)]
+        return CullResult(entries=entries, cutoff=0.0, n_culled=0)
 
     cutoff = threshold * peak
     keep_flags = [s >= cutoff for s in scores]
@@ -163,24 +214,19 @@ def cull_unfocused_images(
         for idx in ranked[:2]:
             keep_flags[idx] = True
 
-    kept: list[Path] = []
-    n_culled = 0
-    for path, score, keep in zip(paths, scores, keep_flags):
-        status = "keep" if keep else "CULL"
-        print(f"  [{status}] {path.name}  (score={score:.4g}, cutoff={cutoff:.4g})")
-        if keep:
-            kept.append(path)
-        else:
-            n_culled += 1
+    entries = [
+        CullEntry(path=p, score=s, kept=k)
+        for p, s, k in zip(paths, scores, keep_flags)
+    ]
+    n_culled = sum(1 for e in entries if not e.kept)
+    result = CullResult(entries=entries, cutoff=cutoff, n_culled=n_culled)
 
-    print(f"Culled {n_culled}/{len(paths)} image(s); {len(kept)} frame(s) remaining.")
-
-    if len(kept) < 2:
+    if len(result.kept) < 2:
         raise ValueError(
             "Fewer than 2 images survived culling. "
             "Lower --cull-threshold or disable --cull."
         )
-    return kept
+    return result
 
 
 def _to_gray_cv(image: np.ndarray) -> np.ndarray:
@@ -956,13 +1002,6 @@ def compute_levels(shape: tuple[int, int], max_levels: int = 6) -> int:
     return levels
 
 
-def save_image(img: np.ndarray, path: Path, quality: int) -> None:
-    fmt = path.suffix.lower().lstrip(".")
-    fmt = "jpeg" if fmt in ("jpg", "jpeg") else fmt.upper()
-    save_kwargs: dict = {"quality": quality} if fmt == "jpeg" else {}
-    Image.fromarray(img).save(path, fmt, **save_kwargs)
-
-
 def _compute_slabs(n: int, slab_size: int, overlap: int) -> list[tuple[int, int]]:
     """Return (start, end) index pairs for a list of n items."""
     step = max(1, slab_size - overlap)
@@ -1090,63 +1129,39 @@ class FocusStackConfig:
     dark_threshold: float = 30.0
     workers: int = 3
     slab: tuple[int, int] | None = None
-    output_steps: bool = False
     only_slab: bool = False
     recursive_slab: bool = False
     on_slab: SlabCallback | None = None
     interrupt: InterruptCallback | None = None
 
 
-class _Checkpoint:
-    __slots__ = ("name", "elapsed", "current_mib", "peak_mib")
-
-    def __init__(self, name: str, elapsed: float, current_mib: float, peak_mib: float) -> None:
-        self.name = name
-        self.elapsed = elapsed
-        self.current_mib = current_mib
-        self.peak_mib = peak_mib
-
-
-def _snap(name: str, step_start: float, checkpoints: list[_Checkpoint]) -> float:
+def _snap(name: str, step_start: float, steps: list[StepStats]) -> float:
     now = time.perf_counter()
     current, peak = tracemalloc.get_traced_memory()
-    checkpoints.append(_Checkpoint(name, now - step_start, current / 2**20, peak / 2**20))
+    steps.append(StepStats(name, now - step_start, current / 2**20, peak / 2**20))
     tracemalloc.reset_peak()
     return now
-
-
-def _format_report(checkpoints: list[_Checkpoint], total_elapsed: float) -> str:
-    name_w = max(len(c.name) for c in checkpoints)
-    header = f"  {'Step':<{name_w}}  {'Time':>8}  {'Current MiB':>12}  {'Peak MiB':>10}"
-    sep = "  " + "-" * (len(header) - 2)
-    rows = [f"  {c.name:<{name_w}}  {c.elapsed:>7.2f}s  {c.current_mib:>11.1f}  {c.peak_mib:>9.1f}"
-            for c in checkpoints]
-    total = f"  {'Total':<{name_w}}  {total_elapsed:>7.2f}s"
-    return "\n".join(["", header, sep, *rows, sep, total])
 
 
 def run(
     cfg: FocusStackConfig,
     progress: ProgressCallback | None = None,
-) -> np.ndarray | list[np.ndarray]:
+) -> RunResult:
     """Run the full focus stacking pipeline and return the result.
 
-    Returns a uint8 RGB ndarray of the stacked image, or a list of ndarray when
-    cfg.only_slab is True (the raw intermediate slab arrays).
-
-    The caller is responsible for saving the returned image. Use save_image() for
-    this purpose.
+    Returns a RunResult with:
+      - image: uint8 RGB ndarray of the stacked image, or None when only_slab is True.
+      - slabs: list of intermediate slab arrays when only_slab is True, else None.
+      - stats: RunStats with per-step timing and memory data.
 
     progress is called throughout as progress(fraction, message) where fraction
     is in [0, 1] across the whole run. The stages and their approximate weight:
       loading ~5%   alignment ~25%   stacking ~65%
-    The final progress(1.0, ...) call delivers the timing and memory report as
-    its message.
 
     Raises Interrupted if cfg.interrupt returns True at any checkpoint.
     Raises ValueError for invalid configuration (bad reference index, slab params).
     """
-    checkpoints: list[_Checkpoint] = []
+    steps: list[StepStats] = []
     t_total = time.perf_counter()
     tracemalloc.start()
     t = t_total
@@ -1158,7 +1173,7 @@ def run(
     _stage(0.0, "Loading images...")
     src_paths, reference_size = load_images(cfg.folder)
     n_images = len(src_paths)
-    t = _snap("Load", t, checkpoints)
+    t = _snap("Load", t, steps)
 
     if cfg.cull is not None:
         _stage(0.02, "Culling unfocused images...")
@@ -1167,14 +1182,19 @@ def run(
             if progress is not None:
                 progress(0.02 + fraction * 0.03, message)
 
-        src_paths = cull_unfocused_images(
+        cull_result = cull_unfocused_images(
             src_paths,
             reference_size,
             threshold=cfg.cull,
             progress=_cull_progress,
         )
+        for entry in cull_result.entries:
+            status = "keep" if entry.kept else "CULL"
+            _stage(0.02, f"  [{status}] {entry.path.name}  (score={entry.score:.4g}, cutoff={cull_result.cutoff:.4g})")
+        _stage(0.05, f"Culled {cull_result.n_culled}/{len(cull_result.entries)} image(s); {len(cull_result.kept)} frame(s) remaining.")
+        src_paths = cull_result.kept
         n_images = len(src_paths)
-        t = _snap("Cull", t, checkpoints)
+        t = _snap("Cull", t, steps)
 
     if cfg.reference >= 0:
         reference = cfg.reference
@@ -1209,7 +1229,7 @@ def run(
             progress=_align_progress,
             interrupt=cfg.interrupt,
         )
-        t = _snap("Align", t, checkpoints)
+        t = _snap("Align", t, steps)
     else:
         _stage(0.08, "Skipping alignment.")
         warps = [identity.copy() for _ in src_paths]
@@ -1230,9 +1250,6 @@ def run(
         if overlap < 0 or overlap >= slab_size:
             raise ValueError(f"Slab OVERLAP must be >= 0 and < SIZE ({slab_size}).")
 
-        if cfg.output_steps and cfg.on_slab is None:
-            _stage(0.30, "Warning: output_steps set but no on_slab callback provided.")
-
         _stage(0.30, "Slabbing...")
         slab_result = slab_images(
             src_paths=src_paths,
@@ -1251,22 +1268,25 @@ def run(
             progress=_stack_progress,
             interrupt=cfg.interrupt,
         )
-        t = _snap("Slab", t, checkpoints)
+        t = _snap("Slab", t, steps)
+
+        tracemalloc.stop()
+        stats = RunStats(steps=steps, total_elapsed=time.perf_counter() - t_total)
+        _stage(1.0, "Complete")
 
         if only_slab:
-            tracemalloc.stop()
-            _stage(1.0, _format_report(checkpoints, time.perf_counter() - t_total))
-            return slab_result  # type: ignore[return-value]
+            return RunResult(image=None, slabs=slab_result, stats=stats)  # type: ignore[arg-type]
 
-        result: np.ndarray = slab_result  # type: ignore[assignment]
-    else:
-        _stage(0.30, "Stacking...")
-        result = stack_images(
-            src_paths, adjusted_warps, levels, cfg.sharpness, cfg.dark_threshold,
-            canvas_size, cfg.no_fill, cfg.workers, _stack_progress, cfg.interrupt,
-        )
-        t = _snap("Stack", t, checkpoints)
+        return RunResult(image=slab_result, slabs=None, stats=stats)  # type: ignore[arg-type]
+
+    _stage(0.30, "Stacking...")
+    result = stack_images(
+        src_paths, adjusted_warps, levels, cfg.sharpness, cfg.dark_threshold,
+        canvas_size, cfg.no_fill, cfg.workers, _stack_progress, cfg.interrupt,
+    )
+    t = _snap("Stack", t, steps)
 
     tracemalloc.stop()
-    _stage(1.0, _format_report(checkpoints, time.perf_counter() - t_total))
-    return result
+    stats = RunStats(steps=steps, total_elapsed=time.perf_counter() - t_total)
+    _stage(1.0, "Complete")
+    return RunResult(image=result, slabs=None, stats=stats)

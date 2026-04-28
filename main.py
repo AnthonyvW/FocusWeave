@@ -6,8 +6,16 @@ import time
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
-from focus_stack import FocusStackConfig, Interrupted, run, save_image
+from focus_stack import FocusStackConfig, Interrupted, run
+
+
+def save_image(img: np.ndarray, path: Path, quality: int) -> None:
+    fmt = path.suffix.lower().lstrip(".")
+    fmt = "jpeg" if fmt in ("jpg", "jpeg") else fmt.upper()
+    save_kwargs: dict = {"quality": quality} if fmt == "jpeg" else {}
+    Image.fromarray(img).save(path, fmt, **save_kwargs)
 
 
 def _progress(fraction: float, message: str) -> None:
@@ -233,7 +241,6 @@ def main() -> None:
         dark_threshold=args.dark_threshold,
         workers=args.workers,
         slab=tuple(args.slab) if args.slab is not None else None,  # type: ignore[arg-type]
-        output_steps=args.output_steps,
         only_slab=args.only_slab,
         recursive_slab=args.recursive_slab,
         on_slab=_on_slab if output_steps else None,
@@ -248,13 +255,15 @@ def main() -> None:
         print(f"Error: {e}")
         sys.exit(1)
 
-    if isinstance(result, list):
+    print(result.stats.format_report())
+
+    if result.slabs is not None:
         if steps_dir is not None:
             print(f"Slabs saved to: {steps_dir}")
         return
 
     t_save = time.perf_counter()
-    save_image(result, out_path, args.quality)
+    save_image(result.image, out_path, args.quality)  # type: ignore[arg-type]
     print(f"Saved: {out_path} ({time.perf_counter() - t_save:.2f}s)")
 
 
