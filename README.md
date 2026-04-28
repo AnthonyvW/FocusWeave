@@ -5,13 +5,11 @@ Focus stacking via Laplacian pyramid fusion. Takes a set of images captured at
 different focus distances and combines them into a single image where the entire
 subject is sharp.
 
-Installation
-------------
-Requires Python 3.10 or newer. Install with pip:
-
-    pip install .
-
-Once installed, the `focusweave` command is available on your PATH.
+Download
+--------
+Pre-built executables for Windows and Ubuntu are available on the
+[releases tab](https://github.com/yourname/focusweave/releases). Download
+the binary for your platform.
 
 Basic usage
 -----------
@@ -96,6 +94,14 @@ Slabbing splits a large image set into overlapping sub-stacks, stacks each one i
     --slab-format EXT       File format for slab output images (e.g. tiff, png, jpg).
                             Defaults to tiff. Requires --output-steps or --only-slab.
 
+Memory usage
+------------
+With default settings (3 workers), expect around 200 MiB per megapixel of input
+image resolution. To halve memory usage at the cost of roughly double the
+processing time, set workers to 1:
+
+    focusweave path/to/images/ --workers 1
+
 Python API
 ----------
 focusweave can be installed as a dependency in your own project and used
@@ -172,13 +178,13 @@ except Interrupted:
 
 See `api_example.py` for a more complete example.
 
-Memory usage
-------------
-With default settings (3 workers), expect around 200 MiB per megapixel of input
-image resolution. To halve memory usage at the cost of roughly double the
-processing time, set workers to 1:
+Installation from source
+------------------------
+If you prefer to install from source, Python 3.10 or newer is required:
 
-    focusweave path/to/images/ --workers 1
+    pip install .
+
+Once installed, the `focusweave` command is available on your PATH.
 
 Algorithms
 ----------
