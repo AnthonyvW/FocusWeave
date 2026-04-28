@@ -101,32 +101,6 @@ def _score_map_to_scalar(score_map: np.ndarray) -> float:
     return hf_energy / lf_energy if lf_energy > 0 else 0.0
 
 
-def _save_focus_map(
-    score_map: np.ndarray,
-    path: Path,
-    debug_dir: Path,
-    global_log_min: float,
-    global_log_max: float,
-) -> None:
-    """Save a single focus score map as a normalised 16-bit PNG.
-
-    A log1p transform is applied before normalisation to compress the extreme
-    dynamic range of raw Tenengrad values (squaring small Sobel magnitudes
-    spreads values across many orders of magnitude). Global min/max are passed
-    in so all maps in a batch share the same scale, keeping brightness
-    comparable across frames: a brighter pixel genuinely indicates a higher
-    focus score relative to the rest of the stack.
-    """
-    log_map = np.log1p(score_map)
-    if global_log_max > global_log_min:
-        norm = ((log_map - global_log_min) / (global_log_max - global_log_min) * 65535)
-        norm = np.clip(norm, 0, 65535).astype(np.uint16)
-    else:
-        norm = np.zeros_like(log_map, dtype=np.uint16)
-    out_path = debug_dir / f"focusmap_{path.stem}.png"
-    cv2.imwrite(str(out_path), norm)
-
-
 def _compute_all_score_maps(
     paths: list[Path],
     reference_size: tuple[int, int],
@@ -154,33 +128,10 @@ def _compute_all_score_maps(
     return maps, scores
 
 
-def save_focus_maps(
-    paths: list[Path],
-    score_maps: list[np.ndarray],
-    debug_dir: Path,
-) -> None:
-    """Save all focus score maps as globally-normalised 16-bit PNGs.
-
-    Maps are written to debug_dir as focusmap_<stem>.png. All images share the
-    same log-scale normalisation so brightness is directly comparable across
-    frames. Brighter regions are sharper; the brightest frame overall is the
-    candidate reference.
-    """
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    log_maps = [np.log1p(m) for m in score_maps]
-    global_log_min = float(min(m.min() for m in log_maps))
-    global_log_max = float(max(m.max() for m in log_maps))
-    for path, score_map in zip(paths, score_maps):
-        _save_focus_map(score_map, path, debug_dir, global_log_min, global_log_max)
-    print(f"Focus maps saved to: {debug_dir}/")
-
-
-
 def cull_unfocused_images(
     paths: list[Path],
     reference_size: tuple[int, int],
     threshold: float = 0.05,
-    debug_dir: Path | None = None,
     progress: ProgressCallback | None = None,
 ) -> list[Path]:
     """Remove images whose focus score falls below threshold × peak score.
@@ -192,9 +143,6 @@ def cull_unfocused_images(
     At least the two sharpest frames are always retained so the stack can
     proceed even when threshold is set very high.
 
-    When debug_dir is set, each image's score map is saved there as a
-    globally-normalised 16-bit PNG via save_focus_maps.
-
     progress is called as progress(fraction, message) after each image.
 
     Raises ValueError if fewer than 2 images survive (guards against degenerate
@@ -202,9 +150,6 @@ def cull_unfocused_images(
     """
     score_maps, scores = _compute_all_score_maps(paths, reference_size,
                                                  progress=progress)
-
-    if debug_dir is not None:
-        save_focus_maps(paths, score_maps, debug_dir)
 
     peak = max(scores)
     if peak == 0.0:
@@ -1150,7 +1095,6 @@ class FocusStackConfig:
     recursive_slab: bool = False
     on_slab: SlabCallback | None = None
     interrupt: InterruptCallback | None = None
-    focus_map_debug_dir: Path | None = None
 
 
 class _Checkpoint:
@@ -1223,12 +1167,10 @@ def run(
             if progress is not None:
                 progress(0.02 + fraction * 0.03, message)
 
-        cull_debug = cfg.focus_map_debug_dir / "cull" if cfg.focus_map_debug_dir else None
         src_paths = cull_unfocused_images(
             src_paths,
             reference_size,
             threshold=cfg.cull,
-            debug_dir=cull_debug,
             progress=_cull_progress,
         )
         n_images = len(src_paths)

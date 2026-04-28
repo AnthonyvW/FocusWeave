@@ -135,15 +135,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--debug-focus-maps", action="store_true",
-        help=(
-            "Save per-image Tenengrad focus score maps as globally-normalised 16-bit PNGs "
-            "for diagnosing culling. Maps are written to 'focusweave_debug/cull/' "
-            "inside the output directory. Brightness is directly comparable across frames: "
-            "brighter regions are sharper. Requires --cull."
-        ),
-    )
-    parser.add_argument(
         "--cull", type=float, nargs="?", const=0.6, default=None,
         metavar="THRESHOLD",
         help=(
@@ -222,8 +213,6 @@ def main() -> None:
         save_image(array, slab_file, args.quality)
         print(f"    Saved: {slab_file} ({time.perf_counter() - t:.2f}s)")
 
-    focus_map_debug_dir = out_path.parent / "focusweave_debug" if args.debug_focus_maps else None
-
     cfg = FocusStackConfig(
         folder=args.folder,
         no_align=args.no_align,
@@ -248,7 +237,6 @@ def main() -> None:
         only_slab=args.only_slab,
         recursive_slab=args.recursive_slab,
         on_slab=_on_slab if output_steps else None,
-        focus_map_debug_dir=focus_map_debug_dir,
     )
 
     try:
