@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "focusweave"
+version = "0.1.0"
+description = "Focus stacking via Laplacian pyramid fusion"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.4.4",
+    "opencv-python-headless>=4.13.0.92",
+    "pillow>=12.2.0",
+    "scipy>=1.17.1",
+]
+
+[project.optional-dependencies]
+gui = ["opencv-python>=4.13.0.92"]
+
+[project.scripts]
+focusweave = "focusweave.main:main"
