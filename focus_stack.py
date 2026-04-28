@@ -41,6 +41,203 @@ def load_images(folder: Path) -> tuple[list[Path], tuple[int, int]]:
     return paths, reference_size
 
 
+def _tenengrad_score_map(
+    path: Path,
+    reference_size: tuple[int, int],
+    ksize: int = 5,
+    max_resolution: int = 1024,
+) -> tuple[np.ndarray, float]:
+    """Compute the Tenengrad score map for a single image path.
+
+    Loads and downscales the image to max_resolution on the long edge, applies
+    CLAHE normalisation, then returns (score_map, scale) where score_map is the
+    raw float32 (Gx² + Gy²) array at the downscaled resolution and scale is the
+    factor applied (1.0 if no downscaling was needed). The caller is responsible
+    for deriving scalar summaries and saving debug output from the returned map.
+    """
+    ref_w, ref_h = reference_size
+    img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
+    if img.shape[1] != ref_w or img.shape[0] != ref_h:
+        img = cv2.resize(img, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
+
+    long_edge = max(img.shape[:2])
+    scale = 1.0
+    if long_edge > max_resolution:
+        scale = max_resolution / long_edge
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_eq = clahe.apply(gray).astype(np.float32) / 255.0
+    gx = cv2.Sobel(gray_eq, cv2.CV_32F, 1, 0, ksize=ksize)
+    gy = cv2.Sobel(gray_eq, cv2.CV_32F, 0, 1, ksize=ksize)
+    return gx ** 2 + gy ** 2, scale
+
+
+def _score_map_to_scalar(score_map: np.ndarray) -> float:
+    """Summarise a 2D score map as the high-to-low spatial frequency energy ratio.
+
+    The score map is normalised to [0, 1] then split into a low-frequency
+    component (Gaussian blur with a large kernel) and a high-frequency residual
+    (original minus blurred). The metric is the ratio of HF energy to LF energy
+    computed over the non-background subject pixels (norm > 0.01).
+
+    Why this works:
+    - Genuine fine texture in the source image produces compact, dot-like bright
+      spots in the score map: high HF energy relative to LF.
+    - Thick halo edges and diffuse glows produce large smooth blobs in the score
+      map: high LF energy, low HF/LF ratio.
+    - Uniformly blurry images have low overall energy in both bands: low ratio.
+
+    The ratio is scale-invariant (division by LF energy) so frames with different
+    overall brightness levels are compared fairly.
+    """
+    norm = score_map / (float(score_map.max()) + 1e-8)
+    lf = cv2.GaussianBlur(norm, (31, 31), 0)
+    hf = norm - lf
+    subj = norm > 0.01
+    lf_energy = float((lf[subj] ** 2).mean())
+    hf_energy = float((hf[subj] ** 2).mean())
+    return hf_energy / lf_energy if lf_energy > 0 else 0.0
+
+
+def _save_focus_map(
+    score_map: np.ndarray,
+    path: Path,
+    debug_dir: Path,
+    global_log_min: float,
+    global_log_max: float,
+) -> None:
+    """Save a single focus score map as a normalised 16-bit PNG.
+
+    A log1p transform is applied before normalisation to compress the extreme
+    dynamic range of raw Tenengrad values (squaring small Sobel magnitudes
+    spreads values across many orders of magnitude). Global min/max are passed
+    in so all maps in a batch share the same scale, keeping brightness
+    comparable across frames: a brighter pixel genuinely indicates a higher
+    focus score relative to the rest of the stack.
+    """
+    log_map = np.log1p(score_map)
+    if global_log_max > global_log_min:
+        norm = ((log_map - global_log_min) / (global_log_max - global_log_min) * 65535)
+        norm = np.clip(norm, 0, 65535).astype(np.uint16)
+    else:
+        norm = np.zeros_like(log_map, dtype=np.uint16)
+    out_path = debug_dir / f"focusmap_{path.stem}.png"
+    cv2.imwrite(str(out_path), norm)
+
+
+def _compute_all_score_maps(
+    paths: list[Path],
+    reference_size: tuple[int, int],
+    ksize: int = 5,
+    max_resolution: int = 1024,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[np.ndarray], list[float]]:
+    """Load and compute Tenengrad score maps and scalar scores for all paths.
+
+    Returns (score_maps, scores).
+
+    progress is called as progress(fraction, message) after each image.
+    """
+    maps: list[np.ndarray] = []
+    scores: list[float] = []
+    n = len(paths)
+    for i, path in enumerate(paths):
+        score_map, _ = _tenengrad_score_map(path, reference_size, ksize=ksize,
+                                             max_resolution=max_resolution)
+        score = _score_map_to_scalar(score_map)
+        maps.append(score_map)
+        scores.append(score)
+        if progress is not None:
+            progress((i + 1) / n, f"Scored {path.name}  ({score:.4f})")
+    return maps, scores
+
+
+def save_focus_maps(
+    paths: list[Path],
+    score_maps: list[np.ndarray],
+    debug_dir: Path,
+) -> None:
+    """Save all focus score maps as globally-normalised 16-bit PNGs.
+
+    Maps are written to debug_dir as focusmap_<stem>.png. All images share the
+    same log-scale normalisation so brightness is directly comparable across
+    frames. Brighter regions are sharper; the brightest frame overall is the
+    candidate reference.
+    """
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    log_maps = [np.log1p(m) for m in score_maps]
+    global_log_min = float(min(m.min() for m in log_maps))
+    global_log_max = float(max(m.max() for m in log_maps))
+    for path, score_map in zip(paths, score_maps):
+        _save_focus_map(score_map, path, debug_dir, global_log_min, global_log_max)
+    print(f"Focus maps saved to: {debug_dir}/")
+
+
+
+def cull_unfocused_images(
+    paths: list[Path],
+    reference_size: tuple[int, int],
+    threshold: float = 0.05,
+    debug_dir: Path | None = None,
+    progress: ProgressCallback | None = None,
+) -> list[Path]:
+    """Remove images whose focus score falls below threshold × peak score.
+
+    Each image is scored by the HF/LF ratio of its Tenengrad score map
+    (see _score_map_to_scalar). A frame is culled when its score is below
+    threshold × (score of the highest-scoring frame).
+
+    At least the two sharpest frames are always retained so the stack can
+    proceed even when threshold is set very high.
+
+    When debug_dir is set, each image's score map is saved there as a
+    globally-normalised 16-bit PNG via save_focus_maps.
+
+    progress is called as progress(fraction, message) after each image.
+
+    Raises ValueError if fewer than 2 images survive (guards against degenerate
+    inputs where the safety floor itself cannot produce 2 valid frames).
+    """
+    score_maps, scores = _compute_all_score_maps(paths, reference_size,
+                                                 progress=progress)
+
+    if debug_dir is not None:
+        save_focus_maps(paths, score_maps, debug_dir)
+
+    peak = max(scores)
+    if peak == 0.0:
+        return paths
+
+    cutoff = threshold * peak
+    keep_flags = [s >= cutoff for s in scores]
+
+    if sum(keep_flags) < 2:
+        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        for idx in ranked[:2]:
+            keep_flags[idx] = True
+
+    kept: list[Path] = []
+    n_culled = 0
+    for path, score, keep in zip(paths, scores, keep_flags):
+        status = "keep" if keep else "CULL"
+        print(f"  [{status}] {path.name}  (score={score:.4g}, cutoff={cutoff:.4g})")
+        if keep:
+            kept.append(path)
+        else:
+            n_culled += 1
+
+    print(f"Culled {n_culled}/{len(paths)} image(s); {len(kept)} frame(s) remaining.")
+
+    if len(kept) < 2:
+        raise ValueError(
+            "Fewer than 2 images survived culling. "
+            "Lower --cull-threshold or disable --cull."
+        )
+    return kept
+
+
 def _to_gray_cv(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
@@ -297,7 +494,10 @@ def align_images(
         aligned += 1
         _notify(aligned, msg)
 
-    # Neighbour-chained: backward pass (reference_idx -> start), warps inverted
+    # Neighbour-chained: backward pass (reference_idx -> start)
+    # _run(prev_gray, src_gray) finds the warp W such that W(src) ≈ prev, i.e. W maps
+    # image[i] → image[i+1]. Chaining cumulative after W gives image[i] → reference,
+    # which is exactly what warpAffine needs. No inversion required.
     cumulative = identity.copy()
     prev_gray = ref_gray
     for i in range(reference_idx - 1, -1, -1):
@@ -310,7 +510,7 @@ def align_images(
             warps[i] = cumulative.copy()
             msg = f"{label}: ECC did not converge — using previous transform"
         else:
-            cumulative = _constrain(_chain_affines(cumulative, _invert_affine(warp)))
+            cumulative = _constrain(_chain_affines(cumulative, warp))
             if no_rotation:
                 cumulative[:, :2] = np.eye(2)
             if _is_negligible(cumulative):
@@ -751,6 +951,7 @@ class FocusStackConfig:
     crop: bool = False
     no_fill: bool = False
     reference: int = -1
+    cull: float | None = None
     global_align: bool = False
     no_rotation: bool = False
     no_scale: bool = False
@@ -768,6 +969,7 @@ class FocusStackConfig:
     recursive_slab: bool = False
     on_slab: SlabCallback | None = None
     interrupt: InterruptCallback | None = None
+    focus_map_debug_dir: Path | None = None
 
 
 class _Checkpoint:
@@ -833,9 +1035,30 @@ def run(
     n_images = len(src_paths)
     t = _snap("Load", t, checkpoints)
 
-    reference = cfg.reference if cfg.reference >= 0 else n_images // 2
-    if not (0 <= reference < n_images):
-        raise ValueError(f"--reference {cfg.reference} is out of range (0\u2013{n_images - 1}).")
+    if cfg.cull is not None:
+        _stage(0.02, "Culling unfocused images...")
+
+        def _cull_progress(fraction: float, message: str) -> None:
+            if progress is not None:
+                progress(0.02 + fraction * 0.03, message)
+
+        cull_debug = cfg.focus_map_debug_dir / "cull" if cfg.focus_map_debug_dir else None
+        src_paths = cull_unfocused_images(
+            src_paths,
+            reference_size,
+            threshold=cfg.cull,
+            debug_dir=cull_debug,
+            progress=_cull_progress,
+        )
+        n_images = len(src_paths)
+        t = _snap("Cull", t, checkpoints)
+
+    if cfg.reference >= 0:
+        reference = cfg.reference
+        if not (0 <= reference < n_images):
+            raise ValueError(f"--reference {cfg.reference} is out of range (0\u2013{n_images - 1}).")
+    else:
+        reference = n_images // 2
 
     ref_w, ref_h = reference_size
     levels = cfg.levels if cfg.levels > 0 else compute_levels((ref_h, ref_w))
@@ -843,11 +1066,11 @@ def run(
     identity = np.eye(2, 3, dtype=np.float32)
     if not cfg.no_align:
         strategy = "global" if cfg.global_align else "neighbour-chained"
-        _stage(0.05, f"Aligning ({strategy}, reference image {reference + 1})...")
+        _stage(0.08, f"Aligning ({strategy}, reference image {reference + 1})...")
 
         def _align_progress(fraction: float, message: str) -> None:
             if progress is not None:
-                progress(0.05 + fraction * 0.25, message)
+                progress(0.08 + fraction * 0.22, message)
 
         warps = align_images(
             src_paths,
@@ -865,7 +1088,7 @@ def run(
         )
         t = _snap("Align", t, checkpoints)
     else:
-        _stage(0.05, "Skipping alignment.")
+        _stage(0.08, "Skipping alignment.")
         warps = [identity.copy() for _ in src_paths]
 
     use_slabs = cfg.slab is not None

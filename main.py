@@ -11,14 +11,8 @@ from focus_stack import FocusStackConfig, Interrupted, run, save_image
 
 
 def _progress(fraction: float, message: str) -> None:
-    if fraction >= 1.0:
-        print(f"\r  [{'#' * 30}] 100.0%")
-        print(message)
-        return
-    bar_width = 30
-    filled = int(bar_width * fraction)
-    bar = "#" * filled + "-" * (bar_width - filled)
-    print(f"\r  [{bar}] {fraction * 100:5.1f}%  {message:<40}", end="", flush=True)
+    if message:
+        print(f"  {fraction * 100:5.1f}%  {message}")
 
 
 def main() -> None:
@@ -128,7 +122,7 @@ def main() -> None:
             "Higher values favour the sharpest image more aggressively at each pixel, "
             "approaching a hard winner-take-all selection. "
             "Lower values blend more smoothly across images. "
-            "Useful range is roughly 1.0 (soft) to 16.0 (near-hard)."
+            "Useful range is roughly 1.0 (soft) to 8.0 (near-hard)."
         ),
     )
     parser.add_argument(
@@ -138,6 +132,26 @@ def main() -> None:
             "Pixels with L below this value have their a/b channels lerped toward 128 (achromatic), "
             "preventing color drift in dark/black regions caused by floating point reconstruction error. "
             "Raise if color casts remain in shadows; lower if legitimate dark colors are being desaturated."
+        ),
+    )
+    parser.add_argument(
+        "--debug-focus-maps", action="store_true",
+        help=(
+            "Save per-image Tenengrad focus score maps as globally-normalised 16-bit PNGs "
+            "for diagnosing culling. Maps are written to 'focusweave_debug/cull/' "
+            "inside the output directory. Brightness is directly comparable across frames: "
+            "brighter regions are sharper. Requires --cull."
+        ),
+    )
+    parser.add_argument(
+        "--cull", type=float, nargs="?", const=0.6, default=None,
+        metavar="THRESHOLD",
+        help=(
+            "Remove wholly out-of-focus images before stacking. "
+            "Each frame is scored by its Tenengrad response; frames below THRESHOLD x peak score "
+            "are dropped. At least the two sharpest frames are always retained. "
+            "THRESHOLD defaults to 0.6 when --cull is given without a value; "
+            "raise toward 1.0 to cull more aggressively, lower toward 0.0 to keep almost everything."
         ),
     )
     parser.add_argument(
@@ -208,6 +222,8 @@ def main() -> None:
         save_image(array, slab_file, args.quality)
         print(f"    Saved: {slab_file} ({time.perf_counter() - t:.2f}s)")
 
+    focus_map_debug_dir = out_path.parent / "focusweave_debug" if args.debug_focus_maps else None
+
     cfg = FocusStackConfig(
         folder=args.folder,
         no_align=args.no_align,
@@ -215,6 +231,7 @@ def main() -> None:
         crop=args.crop,
         no_fill=args.no_fill,
         reference=args.reference,
+        cull=args.cull,
         global_align=args.global_align,
         no_rotation=args.no_rotation,
         no_scale=args.no_scale,
@@ -231,6 +248,7 @@ def main() -> None:
         only_slab=args.only_slab,
         recursive_slab=args.recursive_slab,
         on_slab=_on_slab if output_steps else None,
+        focus_map_debug_dir=focus_map_debug_dir,
     )
 
     try:
