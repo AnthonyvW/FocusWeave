@@ -29,7 +29,7 @@ class Interrupted(Exception):
 
 @dataclass
 class CullEntry:
-    path: Path
+    path: Path | np.ndarray
     score: float
     kept: bool
 
@@ -41,7 +41,7 @@ class CullResult:
     n_culled: int
 
     @property
-    def kept(self) -> list[Path]:
+    def kept(self) -> list[Path | np.ndarray]:
         return [e.path for e in self.entries if e.kept]
 
 
@@ -82,6 +82,11 @@ def _elapsed(start: float) -> str:
 
 
 def load_images(folder: Path) -> tuple[list[Path], tuple[int, int]]:
+    """Discover image paths in a folder and return them with the reference size.
+
+    Paths are sorted alphabetically. Raises ValueError if fewer than 2 images
+    are found. The reference size is read from the first image.
+    """
     paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
     if len(paths) < 2:
         raise ValueError(f"Need at least 2 images in '{folder}', found {len(paths)}.")
@@ -91,22 +96,54 @@ def load_images(folder: Path) -> tuple[list[Path], tuple[int, int]]:
     return paths, reference_size
 
 
+def resolve_images(
+    images: Path | list[Path] | list[np.ndarray],
+) -> tuple[list[Path] | list[np.ndarray], tuple[int, int]]:
+    """Resolve the images argument into a uniform (items, reference_size) pair.
+
+    Accepts:
+      - a Path to a folder: discovers image files, reads size from the first.
+      - a list of Paths: uses them as-is, reads size from the first file.
+      - a list of ndarrays: uses them as-is, reads size from the first array.
+
+    Raises ValueError if fewer than 2 images are provided.
+    """
+    if isinstance(images, Path):
+        return load_images(images)
+
+    if len(images) < 2:
+        raise ValueError(f"Need at least 2 images, got {len(images)}.")
+
+    if isinstance(images[0], np.ndarray):
+        imgs: list[np.ndarray] = images  # type: ignore[assignment]
+        h, w = imgs[0].shape[:2]
+        return imgs, (w, h)
+
+    paths: list[Path] = images  # type: ignore[assignment]
+    img0 = Image.open(paths[0]).convert("RGB")
+    return paths, img0.size
+
+
 def _tenengrad_score_map(
-    path: Path,
+    path: Path | np.ndarray,
     reference_size: tuple[int, int],
     ksize: int = 5,
     max_resolution: int = 1024,
 ) -> tuple[np.ndarray, float]:
-    """Compute the Tenengrad score map for a single image path.
+    """Compute the Tenengrad score map for a single image.
 
-    Loads and downscales the image to max_resolution on the long edge, applies
-    CLAHE normalisation, then returns (score_map, scale) where score_map is the
-    raw float32 (Gx² + Gy²) array at the downscaled resolution and scale is the
-    factor applied (1.0 if no downscaling was needed). The caller is responsible
-    for deriving scalar summaries and saving debug output from the returned map.
+    Accepts a file path or a pre-loaded uint8 RGB ndarray. Loads and downscales
+    the image to max_resolution on the long edge, applies CLAHE normalisation,
+    then returns (score_map, scale) where score_map is the raw float32
+    (Gx² + Gy²) array at the downscaled resolution and scale is the factor
+    applied (1.0 if no downscaling was needed). The caller is responsible for
+    deriving scalar summaries and saving debug output from the returned map.
     """
     ref_w, ref_h = reference_size
-    img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
+    if isinstance(path, np.ndarray):
+        img = path.astype(np.uint8)
+    else:
+        img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
     if img.shape[1] != ref_w or img.shape[0] != ref_h:
         img = cv2.resize(img, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
 
@@ -152,13 +189,13 @@ def _score_map_to_scalar(score_map: np.ndarray) -> float:
 
 
 def _compute_all_score_maps(
-    paths: list[Path],
+    images: list[Path | np.ndarray],
     reference_size: tuple[int, int],
     ksize: int = 5,
     max_resolution: int = 1024,
     progress: ProgressCallback | None = None,
 ) -> tuple[list[np.ndarray], list[float]]:
-    """Load and compute Tenengrad score maps and scalar scores for all paths.
+    """Load and compute Tenengrad score maps and scalar scores for all images.
 
     Returns (score_maps, scores).
 
@@ -166,20 +203,21 @@ def _compute_all_score_maps(
     """
     maps: list[np.ndarray] = []
     scores: list[float] = []
-    n = len(paths)
-    for i, path in enumerate(paths):
-        score_map, _ = _tenengrad_score_map(path, reference_size, ksize=ksize,
-                                             max_resolution=max_resolution)
+    n = len(images)
+    for i, img in enumerate(images):
+        score_map, _ = _tenengrad_score_map(img, reference_size, ksize=ksize,
+                                            max_resolution=max_resolution)
         score = _score_map_to_scalar(score_map)
         maps.append(score_map)
         scores.append(score)
         if progress is not None:
-            progress((i + 1) / n, f"Scored {path.name}  ({score:.4f})")
+            label = img.name if isinstance(img, Path) else f"image_{i}"
+            progress((i + 1) / n, f"Scored {label}  ({score:.4f})")
     return maps, scores
 
 
 def cull_unfocused_images(
-    paths: list[Path],
+    images: list[Path | np.ndarray],
     reference_size: tuple[int, int],
     threshold: float = 0.05,
     progress: ProgressCallback | None = None,
@@ -198,12 +236,12 @@ def cull_unfocused_images(
     Raises ValueError if fewer than 2 images survive (guards against degenerate
     inputs where the safety floor itself cannot produce 2 valid frames).
     """
-    score_maps, scores = _compute_all_score_maps(paths, reference_size,
+    score_maps, scores = _compute_all_score_maps(images, reference_size,
                                                  progress=progress)
 
     peak = max(scores)
     if peak == 0.0:
-        entries = [CullEntry(path=p, score=s, kept=True) for p, s in zip(paths, scores)]
+        entries = [CullEntry(path=img, score=s, kept=True) for img, s in zip(images, scores)]
         return CullResult(entries=entries, cutoff=0.0, n_culled=0)
 
     cutoff = threshold * peak
@@ -215,8 +253,8 @@ def cull_unfocused_images(
             keep_flags[idx] = True
 
     entries = [
-        CullEntry(path=p, score=s, kept=k)
-        for p, s, k in zip(paths, scores, keep_flags)
+        CullEntry(path=img, score=s, kept=k)
+        for img, s, k in zip(images, scores, keep_flags)
     ]
     n_culled = sum(1 for e in entries if not e.kept)
     result = CullResult(entries=entries, cutoff=cutoff, n_culled=n_culled)
@@ -533,7 +571,7 @@ def _constrain_warp(
 
 
 def align_images(
-    src_paths: list[Path],
+    images: list[Path | np.ndarray],
     reference_size: tuple[int, int],
     reference_idx: int = 0,
     global_align: bool = False,
@@ -578,14 +616,17 @@ def align_images(
     """
     ref_w, ref_h = reference_size
     identity = np.eye(2, 3, dtype=np.float32)
-    n = len(src_paths)
+    n = len(images)
     n_to_align = n - 1
 
-    def _load_raw_gray(path: Path) -> np.ndarray:
-        img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
-        if img.shape[1] != ref_w or img.shape[0] != ref_h:
-            img = cv2.resize(img, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
-        return _to_gray_cv(img)
+    def _load_raw_gray(img: Path | np.ndarray) -> np.ndarray:
+        if isinstance(img, np.ndarray):
+            arr = np.clip(img, 0, 255).astype(np.uint8)
+        else:
+            arr = np.array(Image.open(img).convert("RGB"), dtype=np.uint8)
+        if arr.shape[1] != ref_w or arr.shape[0] != ref_h:
+            arr = cv2.resize(arr, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
+        return _to_gray_cv(arr)
 
     def _is_negligible(warp: np.ndarray) -> bool:
         translation = np.linalg.norm(warp[:, 2])
@@ -601,7 +642,7 @@ def align_images(
         if interrupt is not None and interrupt():
             raise Interrupted
 
-    ref_gray = _load_raw_gray(src_paths[reference_idx])
+    ref_gray = _load_raw_gray(images[reference_idx])
     warps: list[np.ndarray] = [identity.copy()] * n
     warps[reference_idx] = identity.copy()
     aligned = 0
@@ -620,7 +661,7 @@ def align_images(
         for i in range(n):
             if i == reference_idx:
                 continue
-            src_gray = _load_raw_gray(src_paths[i])
+            src_gray = _load_raw_gray(images[i])
             warp, converged = _run(reference_idx, ref_gray, i, src_gray)
             warp = _constrain(warp)
             label = f"Image {i + 1}"
@@ -642,7 +683,7 @@ def align_images(
     prev_gray = ref_gray
     prev_idx = reference_idx
     for i in range(reference_idx + 1, n):
-        src_gray = _load_raw_gray(src_paths[i])
+        src_gray = _load_raw_gray(images[i])
         warp, converged = _run(prev_idx, prev_gray, i, src_gray)
         warp = _constrain(warp)
         prev_gray = src_gray
@@ -672,7 +713,7 @@ def align_images(
     prev_gray = ref_gray
     prev_idx = reference_idx
     for i in range(reference_idx - 1, -1, -1):
-        src_gray = _load_raw_gray(src_paths[i])
+        src_gray = _load_raw_gray(images[i])
         warp, converged = _run(prev_idx, prev_gray, i, src_gray)
         warp = _constrain(warp)
         prev_gray = src_gray
@@ -1015,7 +1056,7 @@ def _compute_slabs(n: int, slab_size: int, overlap: int) -> list[tuple[int, int]
 
 
 def slab_images(
-    src_paths: list[Path],
+    src_paths: list[Path | np.ndarray],
     adjusted_warps: list[np.ndarray],
     slab_size: int,
     overlap: int,
@@ -1110,7 +1151,7 @@ def slab_images(
 
 @dataclass
 class FocusStackConfig:
-    folder: Path
+    images: Path | list[Path] | list[np.ndarray]
     no_align: bool = False
     keep_size: bool = False
     crop: bool = False
@@ -1171,8 +1212,8 @@ def run(
             progress(fraction, message)
 
     _stage(0.0, "Loading images...")
-    src_paths, reference_size = load_images(cfg.folder)
-    n_images = len(src_paths)
+    src_images, reference_size = resolve_images(cfg.images)
+    n_images = len(src_images)
     t = _snap("Load", t, steps)
 
     if cfg.cull is not None:
@@ -1183,17 +1224,18 @@ def run(
                 progress(0.02 + fraction * 0.03, message)
 
         cull_result = cull_unfocused_images(
-            src_paths,
+            src_images,
             reference_size,
             threshold=cfg.cull,
             progress=_cull_progress,
         )
-        for entry in cull_result.entries:
+        for i, entry in enumerate(cull_result.entries):
             status = "keep" if entry.kept else "CULL"
-            _stage(0.02, f"  [{status}] {entry.path.name}  (score={entry.score:.4g}, cutoff={cull_result.cutoff:.4g})")
+            label = entry.path.name if isinstance(entry.path, Path) else f"image_{i}"
+            _stage(0.02, f"  [{status}] {label}  (score={entry.score:.4g}, cutoff={cull_result.cutoff:.4g})")
         _stage(0.05, f"Culled {cull_result.n_culled}/{len(cull_result.entries)} image(s); {len(cull_result.kept)} frame(s) remaining.")
-        src_paths = cull_result.kept
-        n_images = len(src_paths)
+        src_images = cull_result.kept
+        n_images = len(src_images)
         t = _snap("Cull", t, steps)
 
     if cfg.reference >= 0:
@@ -1216,7 +1258,7 @@ def run(
                 progress(0.08 + fraction * 0.22, message)
 
         warps = align_images(
-            src_paths,
+            src_images,
             reference_size,
             reference_idx=reference,
             global_align=cfg.global_align,
@@ -1232,7 +1274,7 @@ def run(
         t = _snap("Align", t, steps)
     else:
         _stage(0.08, "Skipping alignment.")
-        warps = [identity.copy() for _ in src_paths]
+        warps = [identity.copy() for _ in src_images]
 
     use_slabs = cfg.slab is not None
     only_slab = cfg.only_slab
@@ -1252,7 +1294,7 @@ def run(
 
         _stage(0.30, "Slabbing...")
         slab_result = slab_images(
-            src_paths=src_paths,
+            src_paths=src_images,
             adjusted_warps=adjusted_warps,
             slab_size=slab_size,
             overlap=overlap,
@@ -1281,7 +1323,7 @@ def run(
 
     _stage(0.30, "Stacking...")
     result = stack_images(
-        src_paths, adjusted_warps, levels, cfg.sharpness, cfg.dark_threshold,
+        src_images, adjusted_warps, levels, cfg.sharpness, cfg.dark_threshold,
         canvas_size, cfg.no_fill, cfg.workers, _stack_progress, cfg.interrupt,
     )
     t = _snap("Stack", t, steps)

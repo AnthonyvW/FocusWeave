@@ -222,7 +222,7 @@ def main() -> None:
         print(f"    Saved: {slab_file} ({time.perf_counter() - t:.2f}s)")
 
     cfg = FocusStackConfig(
-        folder=args.folder,
+        images=args.folder,
         no_align=args.no_align,
         keep_size=args.keep_size,
         crop=args.crop,
