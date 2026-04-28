@@ -242,37 +242,135 @@ def _to_gray_cv(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
 
-def _ecc_align(ref_gray: np.ndarray, src_gray: np.ndarray,
-               max_resolution: int, rough: bool) -> np.ndarray:
-    """Single cv2 ECC alignment pass.
+def _apply_clahe(gray: np.ndarray) -> np.ndarray:
+    """Apply CLAHE to a uint8 grayscale image to boost local contrast."""
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
 
-    Downscales both images so the longer edge is at most max_resolution,
-    runs findTransformECC with MOTION_AFFINE, then rescales the translation
-    component back to full resolution and returns the 2x3 affine matrix.
+
+def _phase_correlation_translation(
+    ref_gray: np.ndarray,
+    src_gray: np.ndarray,
+    max_resolution: int = 512,
+) -> tuple[float, float]:
+    """Estimate translation via phase correlation in the frequency domain.
+
+    Downscales both images to max_resolution on the long edge, computes the
+    normalised cross-power spectrum, and returns the peak shift (tx, ty) scaled
+    back to full resolution. This is robust on low-contrast and textureless
+    regions where gradient-based methods struggle because it operates globally
+    across all frequencies rather than chasing local intensity gradients.
     """
     h, w = ref_gray.shape
-    resolution = max(h, w)
-    if resolution > max_resolution:
-        scale = max_resolution / resolution
-        ref_small = cv2.resize(ref_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        src_small = cv2.resize(src_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    scale = 1.0
+    if max(h, w) > max_resolution:
+        scale = max_resolution / max(h, w)
+        ref_s = cv2.resize(ref_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        src_s = cv2.resize(src_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    else:
+        ref_s, src_s = ref_gray, src_gray
+
+    ref_f = ref_s.astype(np.float32)
+    src_f = src_s.astype(np.float32)
+
+    shift, _ = cv2.phaseCorrelate(src_f, ref_f)
+    return shift[0] / scale, shift[1] / scale
+
+
+def _focus_mask(gray: np.ndarray, percentile: float = 30.0) -> np.ndarray:
+    """Return a uint8 mask of the sharpest pixels in a grayscale image.
+
+    Computes a Laplacian variance map (local sharpness), then thresholds at
+    the given percentile so only the sharper fraction of pixels are kept.
+    The mask is dilated slightly so ECC has continuous regions to work with
+    rather than isolated islands.
+
+    This is the key to reliable macro alignment: ECC is only asked to match
+    pixels that are actually sharp and informative in both frames. Blurry
+    out-of-focus regions — which dominate macro frames and contain misleading
+    intensity patterns — are excluded from the cost function entirely.
+    """
+    lap = cv2.Laplacian(gray.astype(np.float32), cv2.CV_32F, ksize=3)
+    sharpness = cv2.GaussianBlur(lap ** 2, (15, 15), 0)
+    threshold = float(np.percentile(sharpness, percentile))
+    mask = (sharpness >= threshold).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    return cv2.dilate(mask, kernel)
+
+
+def _prepare_for_ecc(gray: np.ndarray, max_resolution: int) -> tuple[np.ndarray, np.ndarray, float]:
+    """Downscale, CLAHE-equalise, and compute the focus mask for one image.
+
+    Returns (clahe_small, mask, scale) where scale is the downscale factor
+    applied (1.0 if no downscaling was needed). Separating this from _ecc_align
+    allows callers to cache the result per image per resolution, avoiding
+    redundant recomputation across the two ECC passes and across the forward/
+    backward neighbour chains where each image appears as both ref and src.
+    """
+    h, w = gray.shape
+    if max(h, w) > max_resolution:
+        scale = max_resolution / max(h, w)
+        small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     else:
         scale = 1.0
-        ref_small = ref_gray
-        src_small = src_gray
+        small = gray
+    equalised = _apply_clahe(small)
+    mask = _focus_mask(equalised)
+    return equalised, mask, scale
 
-    warp = np.eye(2, 3, dtype=np.float32)
+
+def _ecc_align(
+    ref_prepared: tuple[np.ndarray, np.ndarray, float],
+    src_prepared: tuple[np.ndarray, np.ndarray, float],
+    rough: bool,
+    init_warp: np.ndarray | None = None,
+    relaxed: bool = False,
+) -> np.ndarray:
+    """Single cv2 ECC alignment pass using pre-prepared image data.
+
+    Accepts pre-computed (clahe_small, mask, scale) tuples from _prepare_for_ecc
+    so CLAHE and focus mask computation are never repeated across passes or chains.
+
+    Combines the ref and src masks so ECC only fits pixels that are sharp in
+    both frames. Falls back to the union if the intersection is too sparse,
+    and to no mask if the union is also too sparse.
+
+    relaxed=True uses looser termination criteria and more Gaussian smoothing
+    levels, useful as a fallback for difficult image pairs.
+    """
+    ref_small, ref_mask, ref_scale = ref_prepared
+    src_small, src_mask, src_scale = src_prepared
+    scale = ref_scale
+
+    combined_mask = cv2.bitwise_and(ref_mask, src_mask)
+    if cv2.countNonZero(combined_mask) < 100:
+        combined_mask = cv2.bitwise_or(ref_mask, src_mask)
+    input_mask = combined_mask if cv2.countNonZero(combined_mask) >= 100 else None
+
+    warp = init_warp.copy() if init_warp is not None else np.eye(2, 3, dtype=np.float32)
+    if scale != 1.0:
+        warp[0, 2] *= scale
+        warp[1, 2] *= scale
+
     if rough:
-        criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 25, 0.01)
-        gauss_levels = 1
+        if relaxed:
+            criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 50, 0.05)
+            gauss_levels = 3
+        else:
+            criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 25, 0.01)
+            gauss_levels = 1
     else:
-        criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 50, 0.001)
-        gauss_levels = 3
+        if relaxed:
+            criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 100, 0.005)
+            gauss_levels = 5
+        else:
+            criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 50, 0.001)
+            gauss_levels = 3
 
     cv2.findTransformECC(src_small.astype(np.float32),
                          ref_small.astype(np.float32),
                          warp, cv2.MOTION_AFFINE, criteria,
-                         None, gauss_levels)
+                         input_mask, gauss_levels)
 
     warp[0, 2] /= scale
     warp[1, 2] /= scale
@@ -291,29 +389,101 @@ def _invert_affine(warp: np.ndarray) -> np.ndarray:
     return np.linalg.inv(m3)[:2]
 
 
+def _validate_warp(
+    warp: np.ndarray,
+    seed_warp: np.ndarray,
+    image_long_edge: int,
+    translation_tolerance: float = 0.15,
+    affine_distortion_limit: float = 0.02,
+) -> bool:
+    """Return True if warp is plausible for a focus stack frame.
+
+    Two independent checks:
+
+    Translation agreement: the ECC translation must not disagree with the
+    phase-correlation seed by more than translation_tolerance * image_long_edge.
+    A large disagreement means ECC wandered to a false minimum — the
+    phase-correlation estimate is a far more reliable anchor on low-texture
+    subjects.
+
+    Affine distortion: the linear part of the warp (rotation, scale, shear
+    combined) should be close to identity for a focus stack where the camera
+    hasn't moved. The Frobenius distance of the 2x2 linear block from I is
+    bounded by affine_distortion_limit. A warp that passes ECC convergence
+    but returns a large affine distortion is almost certainly a false minimum.
+    """
+    ecc_tx, ecc_ty = warp[0, 2], warp[1, 2]
+    seed_tx, seed_ty = seed_warp[0, 2], seed_warp[1, 2]
+    translation_disagreement = np.hypot(ecc_tx - seed_tx, ecc_ty - seed_ty)
+    if translation_disagreement > translation_tolerance * image_long_edge:
+        return False
+
+    linear = warp[:, :2].astype(np.float64)
+    affine_distortion = float(np.linalg.norm(linear - np.eye(2), ord="fro"))
+    if affine_distortion > affine_distortion_limit:
+        return False
+
+    return True
+
+
 def _run_ecc(
     ref_gray: np.ndarray,
     src_gray: np.ndarray,
     full_res: bool = False,
+    ref_prepared_cache: dict[int, tuple[np.ndarray, np.ndarray, float]] | None = None,
+    src_prepared_cache: dict[int, tuple[np.ndarray, np.ndarray, float]] | None = None,
 ) -> tuple[np.ndarray, bool]:
-    """Run the coarse-to-fine ECC cascade. Returns (warp, converged).
+    """Run the coarse-to-fine ECC cascade with phase correlation seeding and validation.
 
-    The fine pass resolution is adaptive: 2048px by default, or 4096px if the
-    image's long edge exceeds 4096px (i.e. 2048 would be less than half the
-    image size). With full_res=True it runs at the original image size instead.
+    Returns (warp, converged).
+
+    ref_prepared_cache and src_prepared_cache, if provided, are dicts keyed by
+    max_resolution. When a key is present the pre-computed (clahe_small, mask, scale)
+    tuple is used directly; otherwise _prepare_for_ecc is called and the result
+    stored. Pass the same dict across repeated calls for the same image (i.e. once
+    per image in the neighbour chain) to avoid recomputing CLAHE and the focus mask
+    at each resolution more than once per image.
     """
     identity = np.eye(2, 3, dtype=np.float32)
-    warp = identity.copy()
     if full_res:
         fine_res = 2 ** 31
     else:
         long_edge = max(ref_gray.shape)
         fine_res = 4096 if long_edge > 4096 else 2048
+
+    image_long_edge = max(ref_gray.shape)
+    tx, ty = _phase_correlation_translation(ref_gray, src_gray)
+    seed_warp = identity.copy()
+    seed_warp[0, 2] = tx
+    seed_warp[1, 2] = ty
+
+    warp = seed_warp.copy()
     for max_res, rough in [(256, True), (fine_res, False)]:
+        if ref_prepared_cache is not None and max_res in ref_prepared_cache:
+            ref_prep = ref_prepared_cache[max_res]
+        else:
+            ref_prep = _prepare_for_ecc(ref_gray, max_res)
+            if ref_prepared_cache is not None:
+                ref_prepared_cache[max_res] = ref_prep
+
+        if src_prepared_cache is not None and max_res in src_prepared_cache:
+            src_prep = src_prepared_cache[max_res]
+        else:
+            src_prep = _prepare_for_ecc(src_gray, max_res)
+            if src_prepared_cache is not None:
+                src_prepared_cache[max_res] = src_prep
+
         try:
-            warp = _ecc_align(ref_gray, src_gray, max_res, rough)
+            warp = _ecc_align(ref_prep, src_prep, rough, init_warp=warp)
         except cv2.error:
-            return identity.copy(), False
+            try:
+                warp = _ecc_align(ref_prep, src_prep, rough, init_warp=seed_warp, relaxed=True)
+            except cv2.error:
+                return identity.copy(), False
+
+    if not _validate_warp(warp, seed_warp, image_long_edge):
+        return identity.copy(), False
+
     return warp, True
 
 
@@ -434,9 +604,6 @@ def align_images(
     def _constrain(warp: np.ndarray) -> np.ndarray:
         return _constrain_warp(warp, no_rotation, no_scale, no_shear, no_translation)
 
-    def _run(ref: np.ndarray, src: np.ndarray) -> tuple[np.ndarray, bool]:
-        return _run_ecc(ref, src, full_res)
-
     def _notify(done: int, message: str) -> None:
         if progress is not None:
             progress(done / max(n_to_align, 1), message)
@@ -448,12 +615,22 @@ def align_images(
     warps[reference_idx] = identity.copy()
     aligned = 0
 
+    # Per-image caches: dict[max_resolution -> (clahe_small, mask, scale)].
+    # Shared across the forward and backward passes so each image's CLAHE and
+    # focus mask are computed at most once per ECC resolution level.
+    prepared: list[dict[int, tuple[np.ndarray, np.ndarray, float]]] = [{} for _ in range(n)]
+
+    def _run(ref_idx: int, ref: np.ndarray, src_idx: int, src: np.ndarray) -> tuple[np.ndarray, bool]:
+        return _run_ecc(ref, src, full_res,
+                        ref_prepared_cache=prepared[ref_idx],
+                        src_prepared_cache=prepared[src_idx])
+
     if global_align:
         for i in range(n):
             if i == reference_idx:
                 continue
             src_gray = _load_raw_gray(src_paths[i])
-            warp, converged = _run(ref_gray, src_gray)
+            warp, converged = _run(reference_idx, ref_gray, i, src_gray)
             warp = _constrain(warp)
             label = f"Image {i + 1}"
             if not converged:
@@ -472,11 +649,13 @@ def align_images(
     # Neighbour-chained: forward pass (reference_idx -> end)
     cumulative = identity.copy()
     prev_gray = ref_gray
+    prev_idx = reference_idx
     for i in range(reference_idx + 1, n):
         src_gray = _load_raw_gray(src_paths[i])
-        warp, converged = _run(prev_gray, src_gray)
+        warp, converged = _run(prev_idx, prev_gray, i, src_gray)
         warp = _constrain(warp)
         prev_gray = src_gray
+        prev_idx = i
         label = f"Image {i + 1}"
         if not converged:
             warps[i] = cumulative.copy()
@@ -500,11 +679,13 @@ def align_images(
     # which is exactly what warpAffine needs. No inversion required.
     cumulative = identity.copy()
     prev_gray = ref_gray
+    prev_idx = reference_idx
     for i in range(reference_idx - 1, -1, -1):
         src_gray = _load_raw_gray(src_paths[i])
-        warp, converged = _run(prev_gray, src_gray)
+        warp, converged = _run(prev_idx, prev_gray, i, src_gray)
         warp = _constrain(warp)
         prev_gray = src_gray
+        prev_idx = i
         label = f"Image {i + 1}"
         if not converged:
             warps[i] = cumulative.copy()
