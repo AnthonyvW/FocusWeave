@@ -8,7 +8,7 @@ subject is sharp.
 Download
 --------
 Pre-built executables for Windows and Ubuntu are available on the
-[releases tab](https://github.com/yourname/focusweave/releases). Download
+[releases tab](https://github.com/AnthonyvW/FocusWeave/releases). Download
 the binary for your platform.
 
 Basic usage
