@@ -3,13 +3,24 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections import Counter
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 
-from focusweave.focus_stack import IMAGE_EXTENSIONS, FocusStackConfig, Interrupted, run
+from focusweave.focus_stack import (
+    IMAGE_EXTENSIONS,
+    FocusStackConfig,
+    Interrupted,
+    _load_and_warp,
+    align_images,
+    compute_canvas,
+    resolve_images,
+    run,
+)
 
 
 def _get_version() -> str:
@@ -36,6 +47,184 @@ def save_image(img: np.ndarray, path: Path, quality: int) -> None:
 def _progress(fraction: float, stage: str, message: str) -> None:
     if message:
         print(f"  {fraction * 100:5.1f}%  {message}")
+
+
+_MP4_FPS: int = 24
+
+
+def _make_animation(
+    frames_bgr: list[np.ndarray],
+    out_path: Path,
+    duration_s: float,
+    fmt: str = "webp",
+    scale: float = 1.0,
+    gif_colors: int = 256,
+) -> None:
+    """Encode BGR frames into an animated WebP or GIF.
+
+    Frame duration is distributed evenly across all frames. All frames are
+    conformed to the most common (h, w) so the encoder never sees mixed sizes.
+    """
+    frame_duration_ms = int(duration_s * 1000 / len(frames_bgr))
+
+    size_counts: Counter[tuple[int, int]] = Counter(
+        (f.shape[0], f.shape[1]) for f in frames_bgr
+    )
+    canonical_h, canonical_w = size_counts.most_common(1)[0][0]
+    if scale != 1.0:
+        canonical_w = max(1, int(canonical_w * scale))
+        canonical_h = max(1, int(canonical_h * scale))
+
+    pil_frames: list[Image.Image] = []
+    for bgr in frames_bgr:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        target_w = max(1, int(rgb.shape[1] * scale)) if scale != 1.0 else rgb.shape[1]
+        target_h = max(1, int(rgb.shape[0] * scale)) if scale != 1.0 else rgb.shape[0]
+        if target_w != canonical_w or target_h != canonical_h:
+            target_w, target_h = canonical_w, canonical_h
+        if target_w != rgb.shape[1] or target_h != rgb.shape[0]:
+            rgb = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        pil_frame = Image.fromarray(rgb)
+        if fmt == "gif":
+            pil_frame = pil_frame.quantize(
+                colors=gif_colors,
+                method=Image.Quantize.MEDIANCUT,
+                dither=Image.Dither.NONE,
+            )
+        pil_frames.append(pil_frame)
+
+    save_kwargs: dict = {
+        "save_all": True,
+        "append_images": pil_frames[1:],
+        "duration": frame_duration_ms,
+        "loop": 0,
+    }
+    if fmt == "webp":
+        save_kwargs.update({"lossless": False, "quality": 80, "method": 4})
+    elif fmt == "gif":
+        save_kwargs["optimize"] = True
+
+    pil_frames[0].save(str(out_path), **save_kwargs)
+
+
+def _make_video(
+    frames_bgr: list[np.ndarray],
+    out_path: Path,
+    duration_s: float,
+    fmt: str = "mp4",
+    scale: float = 1.0,
+    crf: int = 28,
+) -> None:
+    """Encode BGR frames into an MP4 (H.264) or WebM (VP9) video via imageio-ffmpeg.
+
+    Encodes at a fixed 24fps, repeating each source frame for its proportional
+    share of the total duration so inter-frame compression reduces repeated frames
+    to near-zero bytes.
+    """
+    try:
+        import imageio
+    except ImportError:
+        raise ImportError(
+            "imageio and imageio-ffmpeg are required for video output. "
+            "Install with: pip install imageio imageio-ffmpeg"
+        )
+
+    size_counts: Counter[tuple[int, int]] = Counter(
+        (f.shape[0], f.shape[1]) for f in frames_bgr
+    )
+    canonical_h, canonical_w = size_counts.most_common(1)[0][0]
+    if scale != 1.0:
+        canonical_w = max(2, int(canonical_w * scale))
+        canonical_h = max(2, int(canonical_h * scale))
+    canonical_w += canonical_w % 2
+    canonical_h += canonical_h % 2
+
+    total_video_frames = round(duration_s * _MP4_FPS)
+    n = len(frames_bgr)
+    repeat_counts = [
+        round((i + 1) * total_video_frames / n) - round(i * total_video_frames / n)
+        for i in range(n)
+    ]
+
+    if fmt == "webm":
+        codec = "libvpx-vp9"
+        pixelformat = "yuv420p"
+        extra_params = ["-b:v", "0", "-crf", str(crf)]
+    else:
+        codec = "libx264"
+        pixelformat = "yuv420p"
+        extra_params = ["-crf", str(crf), "-preset", "slow"]
+
+    with imageio.get_writer(
+        str(out_path),
+        format="ffmpeg",
+        mode="I",
+        fps=_MP4_FPS,
+        codec=codec,
+        pixelformat=pixelformat,
+        output_params=extra_params,
+    ) as writer:
+        for bgr, repeat in zip(frames_bgr, repeat_counts):
+            if bgr.shape[1] != canonical_w or bgr.shape[0] != canonical_h:
+                bgr = cv2.resize(bgr, (canonical_w, canonical_h), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            for _ in range(repeat):
+                writer.append_data(rgb)
+
+
+def _build_media_post(
+    src_images: list[Path | np.ndarray],
+    warps: list[np.ndarray],
+    canvas_size: tuple[int, int],
+    no_fill: bool,
+    stacked: np.ndarray | None,
+    out_path: Path,
+    fmt: str,
+    duration_s: float,
+    scale: float,
+    gif_colors: int,
+    crf: int,
+) -> None:
+    """Warp each source frame onto the canvas and encode as an animation.
+
+    When stacked is provided (combined mode) it is placed to the right of each
+    animation frame before encoding. The stacked panel is resized to match the
+    animation frame height so the composite is always rectangular.
+
+    Frames are produced as uint8 RGB arrays then converted to BGR before being
+    passed to the encoders, which expect BGR input (matching the focus_overlay
+    convention).
+    """
+    border_mode = cv2.BORDER_CONSTANT if no_fill else cv2.BORDER_REFLECT
+
+    stacked_bgr: np.ndarray | None = None
+    if stacked is not None:
+        stacked_bgr = cv2.cvtColor(stacked, cv2.COLOR_RGB2BGR)
+
+    frames_bgr: list[np.ndarray] = []
+    n = len(src_images)
+    for i, (src, warp) in enumerate(zip(src_images, warps)):
+        print(f"  Rendering frame {i + 1}/{n}...")
+        frame_f32 = _load_and_warp(src, warp, canvas_size, border_mode)
+        frame_u8 = np.clip(frame_f32, 0, 255).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR)
+
+        if stacked_bgr is not None:
+            panel_h = frame_bgr.shape[0]
+            panel_w = int(round(stacked_bgr.shape[1] * panel_h / stacked_bgr.shape[0]))
+            panel = cv2.resize(stacked_bgr, (panel_w, panel_h), interpolation=cv2.INTER_AREA)
+            frame_bgr = np.concatenate([frame_bgr, panel], axis=1)
+
+        frames_bgr.append(frame_bgr)
+
+    if not frames_bgr:
+        print("  No frames produced; skipping animation.")
+        return
+
+    if fmt in ("mp4", "webm"):
+        _make_video(frames_bgr, out_path, duration_s, fmt=fmt, scale=scale, crf=crf)
+    else:
+        _make_animation(frames_bgr, out_path, duration_s, fmt=fmt, scale=scale, gif_colors=gif_colors)
 
 
 def main() -> None:
@@ -217,6 +406,56 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--media-post", choices=["separate", "combined"], default=None,
+        metavar="MODE",
+        help=(
+            "Export an animation alongside the standard stacked output. "
+            "The animation shows each aligned source frame in sequence. "
+            "'separate' outputs the animation alone. "
+            "'combined' places each animation frame to the left of the focus-stacked result. "
+            "Output format is controlled by --media-format (default: webp)."
+        ),
+    )
+    parser.add_argument(
+        "--media-output", type=Path, default=None,
+        help="File path for the media post animation (default: media_post.<ext> inside the input folder).",
+    )
+    parser.add_argument(
+        "--media-format", default="webp", choices=["webp", "gif", "mp4", "webm"],
+        help=(
+            "Animation format: webp (default, smaller, full colour), "
+            "gif (256-colour palette, widest compatibility), "
+            "mp4 (H.264, requires imageio-ffmpeg), "
+            "webm (VP9, recommended for Google Slides, requires imageio-ffmpeg)."
+        ),
+    )
+    parser.add_argument(
+        "--media-duration", type=float, default=5.0,
+        metavar="SECONDS",
+        help="Total animation duration in seconds (default: 5.0).",
+    )
+    parser.add_argument(
+        "--media-scale", type=float, default=1.0,
+        metavar="FACTOR",
+        help=(
+            "Scale factor applied to animation frames before encoding (default: 1.0). "
+            "0.5 halves each dimension, reducing file size by roughly 4x."
+        ),
+    )
+    parser.add_argument(
+        "--media-gif-colors", type=int, default=256,
+        metavar="N",
+        help="Number of palette colours for GIF output (2-256, default: 256).",
+    )
+    parser.add_argument(
+        "--media-crf", type=int, default=28,
+        metavar="CRF",
+        help=(
+            "Constant rate factor for MP4/WebM output (default: 28). "
+            "H.264 range 0-51, VP9 range 0-63. Lower values give higher quality and larger files."
+        ),
+    )
+    parser.add_argument(
         "--version", action="store_true",
         help="Show the focusweave version number and exit.",
     )
@@ -301,6 +540,59 @@ def main() -> None:
     t_save = time.perf_counter()
     save_image(result.image, out_path, args.quality)  # type: ignore[arg-type]
     print(f"Saved: {out_path} ({time.perf_counter() - t_save:.2f}s)")
+
+    if args.media_post is not None:
+        fmt = args.media_format
+        media_out = args.media_output if args.media_output is not None else args.folder / f"media_post.{fmt}"
+
+        print(f"Building media post animation ({args.media_post}, {fmt.upper()})...")
+        t_media = time.perf_counter()
+
+        src_images, reference_size = resolve_images(args.folder)
+        n_images = len(src_images)
+        reference = n_images // 2 if args.reference < 0 else args.reference
+
+        identity = np.eye(2, 3, dtype=np.float32)
+        if not args.no_align:
+            warps = align_images(
+                src_images,
+                reference_size,
+                reference_idx=reference,
+                global_align=args.global_align,
+                no_rotation=args.no_rotation,
+                no_scale=args.no_scale,
+                no_shear=args.no_shear,
+                no_translation=args.no_translation,
+                full_res=args.full_res,
+                min_shift=args.min_shift,
+                progress=_progress,
+            )
+        else:
+            warps = [identity.copy() for _ in src_images]
+
+        canvas_size, adjusted_warps = compute_canvas(
+            warps, reference_size, keep_size=args.keep_size, crop=args.crop
+        )
+
+        stacked_for_media: np.ndarray | None = (
+            result.image if args.media_post == "combined" else None  # type: ignore[assignment]
+        )
+
+        _build_media_post(
+            src_images=src_images,
+            warps=adjusted_warps,
+            canvas_size=canvas_size,
+            no_fill=args.no_fill,
+            stacked=stacked_for_media,
+            out_path=media_out,
+            fmt=fmt,
+            duration_s=args.media_duration,
+            scale=args.media_scale,
+            gif_colors=args.media_gif_colors,
+            crf=args.media_crf,
+        )
+        print(f"Saved: {media_out} ({time.perf_counter() - t_media:.2f}s)")
+
     print(f"Done ({time.perf_counter() - t_start:.2f}s total)")
 
 
