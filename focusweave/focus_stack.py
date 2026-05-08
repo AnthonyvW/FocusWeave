@@ -193,11 +193,11 @@ def cull_unfocused_images(
     threshold: float = 0.05,
     progress: ProgressCallback | None = None,
 ) -> CullResult:
-    """Remove images whose focus score falls below threshold × peak score.
+    """Remove images whose focus score falls below threshold.
 
     Each image is scored by the HF/LF ratio of its Tenengrad score map
-    (see _score_map_to_scalar). A frame is culled when its score is below
-    threshold × (score of the highest-scoring frame).
+    (see _score_map_to_scalar). A frame is culled when its raw score is below
+    threshold.
 
     At least the two sharpest frames are always retained so the stack can
     proceed even when threshold is set very high.
@@ -213,10 +213,9 @@ def cull_unfocused_images(
     peak = max(scores)
     if peak == 0.0:
         entries = [CullEntry(path=img, score=s, kept=True) for img, s in zip(images, scores)]
-        return CullResult(entries=entries, cutoff=0.0, n_culled=0)
+        return CullResult(entries=entries, cutoff=threshold, n_culled=0)
 
-    cutoff = threshold * peak
-    keep_flags = [s >= cutoff for s in scores]
+    keep_flags = [s >= threshold for s in scores]
 
     if sum(keep_flags) < 2:
         ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
@@ -228,7 +227,7 @@ def cull_unfocused_images(
         for img, s, k in zip(images, scores, keep_flags)
     ]
     n_culled = sum(1 for e in entries if not e.kept)
-    result = CullResult(entries=entries, cutoff=cutoff, n_culled=n_culled)
+    result = CullResult(entries=entries, cutoff=threshold, n_culled=n_culled)
 
     if len(result.kept) < 2:
         raise ValueError(

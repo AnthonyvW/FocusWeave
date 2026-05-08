@@ -162,10 +162,9 @@ def main() -> None:
         metavar="THRESHOLD",
         help=(
             "Remove wholly out-of-focus images before stacking. "
-            "Each frame is scored by its Tenengrad response; frames below THRESHOLD x peak score "
-            "are dropped. At least the two sharpest frames are always retained. "
-            "THRESHOLD defaults to 0.6 when --cull is given without a value; "
-            "raise toward 1.0 to cull more aggressively, lower toward 0.0 to keep almost everything."
+            "Each frame is scored by its Tenengrad HF/LF ratio; frames whose score falls below "
+            "THRESHOLD are dropped. At least the two sharpest frames are always retained. "
+            "THRESHOLD defaults to 0.6 when --cull is given without a value."
         ),
     )
     parser.add_argument(
