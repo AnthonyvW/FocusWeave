@@ -5,7 +5,7 @@ from collections.abc import Callable
 import cv2
 import numpy as np
 
-from focus_stack import (
+from focusweave.focus_stack import (
     ProgressCallback,
     RunResult,
     _K1D,
