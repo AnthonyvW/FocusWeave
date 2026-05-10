@@ -10,12 +10,13 @@ from typing import Literal
 import cv2
 import numpy as np
 from PIL import Image
-from scipy.ndimage import convolve1d, uniform_filter
 
 
-KERNEL_1D = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16.0
+_K1D = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16.0
+_K1D_X2 = _K1D * 2
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
+
 
 Stage = Literal["loading", "culling", "aligning", "stacking", "slabbing", "complete"]
 
@@ -427,23 +428,21 @@ def _run_ecc(
     ref_prepared_cache: dict[int, tuple[np.ndarray, np.ndarray, float]] | None = None,
     src_prepared_cache: dict[int, tuple[np.ndarray, np.ndarray, float]] | None = None,
 ) -> tuple[np.ndarray, bool]:
-    """Run the coarse-to-fine ECC cascade with phase correlation seeding and validation.
+    """Run ECC alignment seeded by phase correlation.
+
+    Phase correlation provides a reliable translation seed, so a separate
+    coarse ECC pass at 256px is not needed. A single fine pass at 1024px
+    (or full resolution when full_res=True) gives sub-pixel accuracy with
+    roughly 4× less work than running at 2048px.
 
     Returns (warp, converged).
-
-    ref_prepared_cache and src_prepared_cache, if provided, are dicts keyed by
-    max_resolution. When a key is present the pre-computed (clahe_small, mask, scale)
-    tuple is used directly; otherwise _prepare_for_ecc is called and the result
-    stored. Pass the same dict across repeated calls for the same image (i.e. once
-    per image in the neighbour chain) to avoid recomputing CLAHE and the focus mask
-    at each resolution more than once per image.
     """
     identity = np.eye(2, 3, dtype=np.float32)
     if full_res:
         fine_res = 2 ** 31
     else:
         long_edge = max(ref_gray.shape)
-        fine_res = 4096 if long_edge > 4096 else 2048
+        fine_res = min(1024, long_edge)
 
     image_long_edge = max(ref_gray.shape)
     tx, ty = _phase_correlation_translation(ref_gray, src_gray)
@@ -451,29 +450,29 @@ def _run_ecc(
     seed_warp[0, 2] = tx
     seed_warp[1, 2] = ty
 
+    if ref_prepared_cache is not None and fine_res in ref_prepared_cache:
+        ref_prep = ref_prepared_cache[fine_res]
+    else:
+        ref_prep = _prepare_for_ecc(ref_gray, fine_res)
+        if ref_prepared_cache is not None:
+            ref_prepared_cache[fine_res] = ref_prep
+
+    if src_prepared_cache is not None and fine_res in src_prepared_cache:
+        src_prep = src_prepared_cache[fine_res]
+    else:
+        src_prep = _prepare_for_ecc(src_gray, fine_res)
+        if src_prepared_cache is not None:
+            src_prepared_cache[fine_res] = src_prep
+
     warp = seed_warp.copy()
-    for max_res, rough in [(256, True), (fine_res, False)]:
-        if ref_prepared_cache is not None and max_res in ref_prepared_cache:
-            ref_prep = ref_prepared_cache[max_res]
-        else:
-            ref_prep = _prepare_for_ecc(ref_gray, max_res)
-            if ref_prepared_cache is not None:
-                ref_prepared_cache[max_res] = ref_prep
-
-        if src_prepared_cache is not None and max_res in src_prepared_cache:
-            src_prep = src_prepared_cache[max_res]
-        else:
-            src_prep = _prepare_for_ecc(src_gray, max_res)
-            if src_prepared_cache is not None:
-                src_prepared_cache[max_res] = src_prep
-
+    try:
+        warp = _ecc_align(ref_prep, src_prep, rough=False, init_warp=warp)
+    except cv2.error:
         try:
-            warp = _ecc_align(ref_prep, src_prep, rough, init_warp=warp)
+            warp = _ecc_align(ref_prep, src_prep, rough=False,
+                              init_warp=seed_warp, relaxed=True)
         except cv2.error:
-            try:
-                warp = _ecc_align(ref_prep, src_prep, rough, init_warp=seed_warp, relaxed=True)
-            except cv2.error:
-                return identity.copy(), False
+            return identity.copy(), False
 
     if not _validate_warp(warp, seed_warp, image_long_edge):
         return identity.copy(), False
@@ -546,6 +545,7 @@ def align_images(
     no_translation: bool = False,
     full_res: bool = False,
     min_shift: float = 5.0,
+    workers: int = 0,
     progress: ProgressCallback | None = None,
     interrupt: InterruptCallback | None = None,
 ) -> list[np.ndarray]:
@@ -588,7 +588,11 @@ def align_images(
         if isinstance(img, np.ndarray):
             arr = np.clip(img, 0, 255).astype(np.uint8)
         else:
-            arr = np.array(Image.open(img).convert("RGB"), dtype=np.uint8)
+            bgr = cv2.imread(str(img), cv2.IMREAD_COLOR)
+            if bgr is None:
+                arr = np.array(Image.open(img).convert("RGB"), dtype=np.uint8)
+            else:
+                arr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         if arr.shape[1] != ref_w or arr.shape[0] != ref_h:
             arr = cv2.resize(arr, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
         return _to_gray_cv(arr)
@@ -612,10 +616,28 @@ def align_images(
     warps[reference_idx] = identity.copy()
     aligned = 0
 
-    # Per-image caches: dict[max_resolution -> (clahe_small, mask, scale)].
-    # Shared across the forward and backward passes so each image's CLAHE and
-    # focus mask are computed at most once per ECC resolution level.
+    # Pre-load all grayscale images and pre-prepare CLAHE+mask data in parallel.
+    # The ECC chain is serial (each step depends on the previous warp), but loading
+    # and _prepare_for_ecc are pure I/O + compute with no inter-image dependencies.
+    # Pre-filling the cache here removes both from the serial critical path.
+    if full_res:
+        fine_res = 2 ** 31
+    else:
+        long_edge = max(ref_gray.shape)
+        fine_res = min(1024, long_edge)
+
+    grays: list[np.ndarray] = [ref_gray if i == reference_idx else None  # type: ignore[list-item]
+                                for i in range(n)]
     prepared: list[dict[int, tuple[np.ndarray, np.ndarray, float]]] = [{} for _ in range(n)]
+
+    def _preload_and_prepare(i: int) -> None:
+        if grays[i] is None:
+            grays[i] = _load_raw_gray(images[i])
+        prepared[i][fine_res] = _prepare_for_ecc(grays[i], fine_res)
+
+    n_prep_workers = min(n, workers if workers > 0 else (os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=n_prep_workers) as pool:
+        list(pool.map(_preload_and_prepare, range(n)))
 
     def _run(ref_idx: int, ref: np.ndarray, src_idx: int, src: np.ndarray) -> tuple[np.ndarray, bool]:
         return _run_ecc(ref, src, full_res,
@@ -626,7 +648,7 @@ def align_images(
         for i in range(n):
             if i == reference_idx:
                 continue
-            src_gray = _load_raw_gray(images[i])
+            src_gray = grays[i]
             warp, converged = _run(reference_idx, ref_gray, i, src_gray)
             warp = _constrain(warp)
             label = f"Image {i + 1}"
@@ -648,7 +670,7 @@ def align_images(
     prev_gray = ref_gray
     prev_idx = reference_idx
     for i in range(reference_idx + 1, n):
-        src_gray = _load_raw_gray(images[i])
+        src_gray = grays[i]
         warp, converged = _run(prev_idx, prev_gray, i, src_gray)
         warp = _constrain(warp)
         prev_gray = src_gray
@@ -671,14 +693,11 @@ def align_images(
         _notify(aligned, msg)
 
     # Neighbour-chained: backward pass (reference_idx -> start)
-    # _run(prev_gray, src_gray) finds the warp W such that W(src) ≈ prev, i.e. W maps
-    # image[i] → image[i+1]. Chaining cumulative after W gives image[i] → reference,
-    # which is exactly what warpAffine needs. No inversion required.
     cumulative = identity.copy()
     prev_gray = ref_gray
     prev_idx = reference_idx
     for i in range(reference_idx - 1, -1, -1):
-        src_gray = _load_raw_gray(images[i])
+        src_gray = grays[i]
         warp, converged = _run(prev_idx, prev_gray, i, src_gray)
         warp = _constrain(warp)
         prev_gray = src_gray
@@ -703,37 +722,40 @@ def align_images(
     return warps
 
 
-def _smooth(image: np.ndarray) -> np.ndarray:
-    return convolve1d(convolve1d(image, KERNEL_1D, axis=0), KERNEL_1D, axis=1)
-
-
 def reduce(image: np.ndarray) -> np.ndarray:
-    return _smooth(image)[::2, ::2]
+    smoothed = cv2.sepFilter2D(image, cv2.CV_32F, _K1D, _K1D,
+                               borderType=cv2.BORDER_REFLECT)
+    return smoothed[::2, ::2]
 
 
 def expand(image: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
     h, w = image.shape
     upsampled = np.zeros((h * 2, w * 2), dtype=np.float32)
     upsampled[::2, ::2] = image
-    expanded = convolve1d(convolve1d(upsampled, KERNEL_1D * 2, axis=0), KERNEL_1D * 2, axis=1)
+    expanded = cv2.sepFilter2D(upsampled, cv2.CV_32F, _K1D_X2, _K1D_X2,
+                               borderType=cv2.BORDER_REFLECT)
     return expanded[: target_shape[0], : target_shape[1]]
 
 
 def region_energy(lp_level: np.ndarray, window: int = 3) -> np.ndarray:
-    return uniform_filter(lp_level ** 2, size=window)
+    return cv2.sqrBoxFilter(lp_level, cv2.CV_32F, (window, window), normalize=True,
+                            borderType=cv2.BORDER_REFLECT)
 
 
 def region_deviation(image: np.ndarray, window: int = 3) -> np.ndarray:
-    mean = uniform_filter(image, size=window)
-    mean_sq = uniform_filter(image ** 2, size=window)
-    return np.sqrt(np.maximum(mean_sq - mean ** 2, 0))
+    mean = cv2.boxFilter(image, cv2.CV_32F, (window, window),
+                         borderType=cv2.BORDER_REFLECT)
+    sq_mean = cv2.sqrBoxFilter(image, cv2.CV_32F, (window, window), normalize=True,
+                               borderType=cv2.BORDER_REFLECT)
+    return cv2.sqrt(np.maximum(sq_mean - mean * mean, 0.0))
 
 
 def region_entropy(image: np.ndarray, window: int = 8) -> np.ndarray:
     normed = (image - image.min()) / (image.max() - image.min() + 1e-10)
     eps = 1e-10
-    ent = -normed * np.log2(normed + eps) - (1 - normed) * np.log2(1 - normed + eps)
-    return uniform_filter(ent, size=window)
+    ent = (-normed * np.log2(normed + eps) - (1 - normed) * np.log2(1 - normed + eps)).astype(np.float32)
+    return cv2.boxFilter(ent, cv2.CV_32F, (window, window),
+                         borderType=cv2.BORDER_REFLECT)
 
 
 def _image_to_lab(img: np.ndarray) -> np.ndarray:
@@ -744,28 +766,96 @@ def _image_to_lab(img: np.ndarray) -> np.ndarray:
 def _lab_lap_pyramid(lab: np.ndarray, levels: int) -> list[np.ndarray]:
     """Build full 3-channel Laplacian pyramid bands for a Lab image.
 
-    Returns levels+1 entries of shape (H_l, W_l, 3). Builds one level at a
-    time, keeping only the current and next Gaussian in memory simultaneously
-    so the full Gaussian stack is never allocated at once.
-    The luminance Laplacian bands are the [:,:,0] slice of each entry.
+    Returns levels+1 entries of shape (H_l, W_l, 3). Uses cv2.sepFilter2D
+    for vectorized separable convolution across all three channels at once,
+    which is significantly faster than per-channel scipy convolve1d.
     """
     bands: list[np.ndarray] = []
     current = lab
     for _ in range(levels):
-        nxt = np.empty((
-            (current.shape[0] + 1) // 2,
-            (current.shape[1] + 1) // 2,
-            3,
-        ), dtype=np.float32)
-        for c in range(3):
-            nxt[:, :, c] = reduce(current[:, :, c])
-        exp = np.empty_like(current)
-        for c in range(3):
-            exp[:, :, c] = expand(nxt[:, :, c], current.shape[:2])
-        bands.append(current - exp)
+        h, w = current.shape[:2]
+        nh, nw = (h + 1) // 2, (w + 1) // 2
+        smoothed = cv2.sepFilter2D(current, cv2.CV_32F, _K1D, _K1D,
+                                   borderType=cv2.BORDER_REFLECT)
+        nxt = smoothed[::2, ::2, :].copy()
+
+        up = np.zeros((nh * 2, nw * 2, 3), dtype=np.float32)
+        up[::2, ::2, :] = nxt
+        exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
+                              borderType=cv2.BORDER_REFLECT)
+        current -= exp[:h, :w, :]
+        bands.append(current)
         current = nxt
     bands.append(current)
     return bands
+
+
+def _is_pure_translation(warp: np.ndarray, tol: float = 1e-4) -> bool:
+    return bool(np.allclose(warp[:, :2], np.eye(2), atol=tol))
+
+
+def _load_raw_u8(
+    path: Path | np.ndarray,
+    size: tuple[int, int],
+) -> np.ndarray:
+    """Load an image as uint8 RGB, resizing to size if needed.
+
+    Uses cv2.imread for file paths with a PIL fallback for formats cv2 can't
+    read. Pre-loaded uint8 arrays are used as-is. Higher-bit-depth arrays are
+    scaled to uint8 (divide by 257 for 16-bit). 16-bit files are loaded via
+    _load_raw and scaled down, so callers that need full depth should use
+    _load_raw directly.
+    """
+    if isinstance(path, np.ndarray):
+        if path.dtype == np.uint8:
+            img: np.ndarray = path
+        elif path.dtype == np.uint16:
+            img = (path // 257).astype(np.uint8)
+        else:
+            img = np.clip(path, 0, 255).astype(np.uint8)
+    else:
+        bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
+        else:
+            img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    if img.shape[1] != size[0] or img.shape[0] != size[1]:
+        img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+    return img
+
+
+def _load_raw(
+    path: Path | np.ndarray,
+    size: tuple[int, int],
+) -> np.ndarray:
+    """Load an image as float32 RGB in [0, 255] range, resizing if needed.
+
+    Preserves 16-bit files at full precision by reading with IMREAD_UNCHANGED
+    and scaling 16-bit values into [0, 255] (divide by 257). 8-bit files and
+    pre-loaded arrays are handled without precision loss.
+    """
+    if isinstance(path, np.ndarray):
+        img = path.astype(np.float32)
+        if path.dtype == np.uint16:
+            img /= 257.0
+    else:
+        raw = cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+        if raw is None:
+            img = np.array(Image.open(path).convert("RGB"), dtype=np.float32)
+        else:
+            if raw.ndim == 2:
+                raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
+            elif raw.shape[2] == 4:
+                raw = raw[:, :, :3]
+            # cv2 loads as BGR; convert to RGB
+            raw = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+            if raw.dtype == np.uint16:
+                img = raw.astype(np.float32) / 257.0
+            else:
+                img = raw.astype(np.float32)
+    if img.shape[1] != size[0] or img.shape[0] != size[1]:
+        img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+    return img
 
 
 def _load_and_warp(
@@ -774,25 +864,15 @@ def _load_and_warp(
     size: tuple[int, int],
     border_mode: int = cv2.BORDER_REFLECT,
 ) -> np.ndarray:
-    """Load an image (or use an already-loaded array), resize if needed, and apply a warp.
+    """Load an image, resize if needed, and apply a warp. Returns float32 RGB.
 
     size is (w, h) as expected by cv2.warpAffine.
-    border_mode controls how regions outside the source image are filled;
-    cv2.BORDER_REFLECT (default) mirrors edge pixels, cv2.BORDER_CONSTANT fills with black.
-    Returns a float32 RGB array.
     """
-    if isinstance(path, np.ndarray):
-        img = path.astype(np.float32)
-    else:
-        img = np.array(Image.open(path).convert("RGB"), dtype=np.float32)
-    if img.shape[1] != size[0] or img.shape[0] != size[1]:
-        img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+    img = _load_raw_u8(path, size)
     if not np.array_equal(warp, np.eye(2, 3, dtype=np.float32)):
-        u8 = np.clip(img, 0, 255).astype(np.uint8)
-        img = cv2.warpAffine(u8, warp, size,
-                             flags=cv2.INTER_CUBIC,
-                             borderMode=border_mode).astype(np.float32)
-    return img
+        flags = cv2.INTER_LINEAR if _is_pure_translation(warp) else cv2.INTER_CUBIC
+        img = cv2.warpAffine(img, warp, size, flags=flags, borderMode=border_mode)
+    return img.astype(np.float32)
 
 
 def compute_canvas(
@@ -890,69 +970,91 @@ def stack_images(
     if isinstance(src_paths[0], np.ndarray):
         h, w = src_paths[0].shape[:2]
     else:
-        img0 = np.array(Image.open(src_paths[0]).convert("RGB"), dtype=np.float32)
-        h, w = img0.shape[:2]
-        del img0
+        probe = cv2.imread(str(src_paths[0]), cv2.IMREAD_COLOR)
+        if probe is None:
+            probe = np.array(Image.open(src_paths[0]).convert("RGB"), dtype=np.uint8)
+        h, w = probe.shape[:2]
+        del probe
     cv2_size = canvas_size if canvas_size is not None else (w, h)
     border_mode = cv2.BORDER_CONSTANT if no_fill else cv2.BORDER_REFLECT
 
     n = len(src_paths)
     n_workers = min(n, workers if workers > 0 else (os.cpu_count() or 4))
 
-    def _process_image(args: tuple[Path | np.ndarray, np.ndarray]) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        path, warp = args
-        lab = _image_to_lab(_load_and_warp(path, warp, cv2_size, border_mode))
-        lap = _lab_lap_pyramid(lab, levels)
-        del lab
-        energies: list[np.ndarray] = []
-        for i in range(levels):
-            energies.append(region_energy(lap[i][:, :, 0]) ** sharpness)
-        lv = lap[-1][:, :, 0]
-        energies.append(((region_deviation(lv) + region_entropy(lv)) * 0.5) ** sharpness)
-        return energies, lap
+    identity_warp = np.eye(2, 3, dtype=np.float32)
+
+    PartialAccum = tuple[list[np.ndarray], list[np.ndarray]]
+
+    def _process_batch(batch: list[tuple[Path | np.ndarray, np.ndarray]]) -> PartialAccum:
+        local_energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
+        local_fused_lp: list[np.ndarray | None] = [None] * (levels + 1)
+        local_wb: np.ndarray | None = None
+
+        for path, warp in batch:
+            img = _load_raw(path, cv2_size)
+
+            if not np.array_equal(warp, identity_warp):
+                u8 = np.clip(img, 0, 255).astype(np.uint8)
+                flags = cv2.INTER_LINEAR if _is_pure_translation(warp) else cv2.INTER_CUBIC
+                img = cv2.warpAffine(u8, warp, cv2_size, flags=flags,
+                                     borderMode=border_mode).astype(np.float32)
+
+            lab = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8),
+                               cv2.COLOR_RGB2Lab).astype(np.float32)
+            del img
+
+            lap = _lab_lap_pyramid(lab, levels)
+            del lab
+
+            energies: list[np.ndarray] = []
+            for i in range(levels):
+                energies.append(region_energy(lap[i][:, :, 0]) ** sharpness)
+            lv = lap[-1][:, :, 0]
+            energies.append(((region_deviation(lv) + region_entropy(lv)) * 0.5) ** sharpness)
+
+            for i in range(levels + 1):
+                e = energies[i]
+                band = lap[i]
+                lap[i] = None  # type: ignore[call-overload]
+                local_energy_sums[i] = e if local_energy_sums[i] is None else local_energy_sums[i] + e
+                if local_wb is None or local_wb.shape != band.shape:
+                    local_wb = np.empty_like(band)
+                np.multiply(band, e[:, :, np.newaxis], out=local_wb)
+                if local_fused_lp[i] is None:
+                    local_fused_lp[i] = local_wb.copy()
+                else:
+                    local_fused_lp[i] += local_wb  # type: ignore[operator]
+
+        return local_energy_sums, local_fused_lp  # type: ignore[return-value]
 
     if progress is not None:
         progress(0.0, "stacking", f"Fusing ({n_workers} workers)...")
     energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
     fused_lp: list[np.ndarray | None] = [None] * (levels + 1)
-    weighted_buf: np.ndarray | None = None
 
     items = list(zip(src_paths, warps))
+
+    # Distribute images across workers as evenly as possible so each worker
+    # accumulates its own partial fused_lp/energy_sums. The main thread then
+    # merges n_workers partial results instead of accumulating all n images serially.
+    chunk_size = max(1, (len(items) + n_workers - 1) // n_workers)
+    batches = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
     fused = 0
 
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        pending: dict = {}
-        submit_idx = 0
+        futures = {pool.submit(_process_batch, batch): batch for batch in batches}
+        for done in as_completed(futures):
+            partial_energy, partial_fused = done.result()
 
-        while submit_idx < len(items) and len(pending) < n_workers:
-            f = pool.submit(_process_image, items[submit_idx])
-            pending[f] = submit_idx
-            submit_idx += 1
-
-        while pending:
-            done = next(as_completed(pending))
-            pending.pop(done)
-
-            if submit_idx < len(items):
-                f = pool.submit(_process_image, items[submit_idx])
-                pending[f] = submit_idx
-                submit_idx += 1
-
-            energies, lap = done.result()
             for i in range(levels + 1):
-                e = energies[i]
-                band = lap[i]
-                lap[i] = None  # type: ignore[call-overload]
-                energy_sums[i] = e if energy_sums[i] is None else energy_sums[i] + e
-                if weighted_buf is None or weighted_buf.shape != band.shape:
-                    weighted_buf = np.empty_like(band)
-                np.multiply(band, e[:, :, np.newaxis], out=weighted_buf)
-                if fused_lp[i] is None:
-                    fused_lp[i] = weighted_buf.copy()
-                else:
-                    fused_lp[i] += weighted_buf  # type: ignore[operator]
+                energy_sums[i] = (partial_energy[i] if energy_sums[i] is None
+                                  else energy_sums[i] + partial_energy[i])  # type: ignore[operator]
+                fused_lp[i] = (partial_fused[i] if fused_lp[i] is None
+                               else fused_lp[i] + partial_fused[i])  # type: ignore[operator]
 
-            fused += 1
+            batch_size = len(futures[done])
+            fused += batch_size
             if progress is not None:
                 progress(fused / n * 0.7, "stacking", f"Fused image {fused}/{n}")
             if interrupt is not None and interrupt():
@@ -966,8 +1068,12 @@ def stack_images(
     image = fused_lp[-1].copy()  # type: ignore[union-attr]
     for band in reversed(fused_lp[:-1]):
         cur_shape = band.shape[:2]  # type: ignore[union-attr]
-        exp = np.stack([expand(image[:, :, c], cur_shape) for c in range(3)], axis=-1)
-        image = exp + band  # type: ignore[operator]
+        h, w = image.shape[:2]
+        up = np.zeros((h * 2, w * 2, 3), dtype=np.float32)
+        up[::2, ::2, :] = image
+        exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
+                              borderType=cv2.BORDER_REFLECT)
+        image = exp[: cur_shape[0], : cur_shape[1], :] + band  # type: ignore[operator]
     fused_lab = image
 
     if progress is not None:
@@ -1218,6 +1324,7 @@ def run(
             no_translation=cfg.no_translation,
             full_res=cfg.full_res,
             min_shift=cfg.min_shift,
+            workers=cfg.workers,
             progress=_align_progress,
             interrupt=cfg.interrupt,
         )
@@ -1271,5 +1378,6 @@ def run(
         src_images, adjusted_warps, levels, cfg.sharpness, cfg.dark_threshold,
         canvas_size, cfg.no_fill, cfg.workers, _stack_progress, cfg.interrupt,
     )
+
     _stage(1.0, "complete", "Complete")
     return RunResult(image=result, slabs=None)
