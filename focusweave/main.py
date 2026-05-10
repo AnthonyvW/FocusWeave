@@ -6,8 +6,8 @@ import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+import cv2
 import numpy as np
-from PIL import Image
 
 from focusweave.focus_stack import IMAGE_EXTENSIONS, FocusStackConfig, Interrupted, run
 
@@ -27,10 +27,21 @@ def _get_version() -> str:
 
 
 def save_image(img: np.ndarray, path: Path, quality: int) -> None:
-    fmt = path.suffix.lower().lstrip(".")
-    fmt = "jpeg" if fmt in ("jpg", "jpeg") else fmt.upper()
-    save_kwargs: dict = {"quality": quality} if fmt == "jpeg" else {}
-    Image.fromarray(img).save(path, fmt, **save_kwargs)
+    """Save a uint8 or uint16 RGB ndarray to path.
+
+    JPEG and WebP do not support 16-bit depth; uint16 images are converted to
+    uint8 before saving to those formats. All other formats (PNG, TIFF, etc.)
+    retain full 16-bit depth when the array is uint16.
+    """
+    suffix = path.suffix.lower()
+    low_depth_formats = {".jpg", ".jpeg", ".webp"}
+    if img.dtype == np.uint16 and suffix in low_depth_formats:
+        img = (img >> 8).astype(np.uint8)
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    params: list[int] = []
+    if suffix in (".jpg", ".jpeg"):
+        params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    cv2.imwrite(str(path), bgr, params)
 
 
 def _progress(fraction: float, stage: str, message: str) -> None:
@@ -231,7 +242,7 @@ def main() -> None:
 
     if args.formats:
         exts = sorted(IMAGE_EXTENSIONS)
-        print("Supported image extensions (via Pillow):")
+        print("Supported image extensions (via cv2):")
         print("  " + "  ".join(exts))
         return
 

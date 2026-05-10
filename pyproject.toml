@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "focusweave"
-version = "1.0.1"
+version = "1.0.2"
 description = "Focus stacking via Laplacian pyramid fusion"
 requires-python = ">=3.10"
 dependencies = [

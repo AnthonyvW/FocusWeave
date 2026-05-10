@@ -9,7 +9,6 @@ from typing import Literal
 
 import cv2
 import numpy as np
-from PIL import Image
 
 
 _K1D = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16.0
@@ -53,6 +52,15 @@ class RunResult:
     slabs: list[np.ndarray] | None
 
 
+def _cv2_image_size(path: Path) -> tuple[int, int]:
+    """Return (width, height) of an image file using cv2. Raises ValueError on failure."""
+    probe = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if probe is None:
+        raise ValueError(f"cv2 could not read image: '{path}'")
+    h, w = probe.shape[:2]
+    return w, h
+
+
 def load_images(folder: Path) -> tuple[list[Path], tuple[int, int]]:
     """Discover image paths in a folder and return them with the reference size.
 
@@ -63,9 +71,7 @@ def load_images(folder: Path) -> tuple[list[Path], tuple[int, int]]:
     if len(paths) < 2:
         raise ValueError(f"Need at least 2 images in '{folder}', found {len(paths)}.")
 
-    img0 = Image.open(paths[0]).convert("RGB")
-    reference_size: tuple[int, int] = img0.size
-    return paths, reference_size
+    return paths, _cv2_image_size(paths[0])
 
 
 def resolve_images(
@@ -92,8 +98,7 @@ def resolve_images(
         return imgs, (w, h)
 
     paths: list[Path] = images  # type: ignore[assignment]
-    img0 = Image.open(paths[0]).convert("RGB")
-    return paths, img0.size
+    return paths, _cv2_image_size(paths[0])
 
 
 def _tenengrad_score_map(
@@ -111,13 +116,7 @@ def _tenengrad_score_map(
     applied (1.0 if no downscaling was needed). The caller is responsible for
     deriving scalar summaries and saving debug output from the returned map.
     """
-    ref_w, ref_h = reference_size
-    if isinstance(path, np.ndarray):
-        img = path.astype(np.uint8)
-    else:
-        img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
-    if img.shape[1] != ref_w or img.shape[0] != ref_h:
-        img = cv2.resize(img, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
+    img = _load_raw_u8(path, reference_size)
 
     long_edge = max(img.shape[:2])
     scale = 1.0
@@ -585,17 +584,7 @@ def align_images(
     n_to_align = n - 1
 
     def _load_raw_gray(img: Path | np.ndarray) -> np.ndarray:
-        if isinstance(img, np.ndarray):
-            arr = np.clip(img, 0, 255).astype(np.uint8)
-        else:
-            bgr = cv2.imread(str(img), cv2.IMREAD_COLOR)
-            if bgr is None:
-                arr = np.array(Image.open(img).convert("RGB"), dtype=np.uint8)
-            else:
-                arr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        if arr.shape[1] != ref_w or arr.shape[0] != ref_h:
-            arr = cv2.resize(arr, (ref_w, ref_h), interpolation=cv2.INTER_AREA)
-        return _to_gray_cv(arr)
+        return _to_gray_cv(_load_raw_u8(img, (ref_w, ref_h)))
 
     def _is_negligible(warp: np.ndarray) -> bool:
         translation = np.linalg.norm(warp[:, 2])
@@ -758,8 +747,31 @@ def region_entropy(image: np.ndarray, window: int = 8) -> np.ndarray:
                          borderType=cv2.BORDER_REFLECT)
 
 
-def _image_to_lab(img: np.ndarray) -> np.ndarray:
-    u8 = np.clip(img, 0, 255).astype(np.uint8)
+def _source_depth(src: Path | np.ndarray) -> int:
+    """Return 8 or 16 based on the bit depth of the first source image or array.
+
+    For file paths, reads the file header only (IMREAD_UNCHANGED on a 1x1 crop
+    is not possible, so we read the full file but only inspect dtype). For
+    ndarrays, inspects dtype directly. Anything that is not uint16 is treated
+    as 8-bit.
+    """
+    if isinstance(src, np.ndarray):
+        return 16 if src.dtype == np.uint16 else 8
+    raw = cv2.imread(str(src), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+    if raw is None:
+        raise ValueError(f"cv2 could not read image: '{src}'")
+    return 16 if raw.dtype == np.uint16 else 8
+
+
+def _image_to_lab(img: np.ndarray, max_val: float) -> np.ndarray:
+    """Convert a float32 RGB image to Lab float32.
+
+    max_val is the white-point of img (255.0 for 8-bit sources, 65535.0 for
+    16-bit). cv2 requires uint8 [0, 255] input so the image is scaled to that
+    range before conversion. The resulting Lab values use cv2's uint8 encoding
+    (L in [0, 255], a/b in [0, 255] with neutral at 128).
+    """
+    u8 = np.clip(img * (255.0 / max_val), 0, 255).astype(np.uint8)
     return cv2.cvtColor(u8, cv2.COLOR_RGB2Lab).astype(np.float32)
 
 
@@ -800,25 +812,22 @@ def _load_raw_u8(
 ) -> np.ndarray:
     """Load an image as uint8 RGB, resizing to size if needed.
 
-    Uses cv2.imread for file paths with a PIL fallback for formats cv2 can't
-    read. Pre-loaded uint8 arrays are used as-is. Higher-bit-depth arrays are
-    scaled to uint8 (divide by 257 for 16-bit). 16-bit files are loaded via
-    _load_raw and scaled down, so callers that need full depth should use
-    _load_raw directly.
+    Used only for alignment and sharpness scoring, where 8-bit precision is
+    sufficient. 16-bit arrays and files are scaled down to uint8.
+    Raises ValueError if cv2 cannot read the file.
     """
     if isinstance(path, np.ndarray):
         if path.dtype == np.uint8:
             img: np.ndarray = path
         elif path.dtype == np.uint16:
-            img = (path // 257).astype(np.uint8)
+            img = (path >> 8).astype(np.uint8)
         else:
-            img = np.clip(path, 0, 255).astype(np.uint8)
+            img = np.clip(path / 257.0, 0, 255).astype(np.uint8)
     else:
         bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if bgr is None:
-            img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
-        else:
-            img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            raise ValueError(f"cv2 could not read image: '{path}'")
+        img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     if img.shape[1] != size[0] or img.shape[0] != size[1]:
         img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
     return img
@@ -828,31 +837,25 @@ def _load_raw(
     path: Path | np.ndarray,
     size: tuple[int, int],
 ) -> np.ndarray:
-    """Load an image as float32 RGB in [0, 255] range, resizing if needed.
+    """Load an image as float32 RGB in its native range, resizing if needed.
 
-    Preserves 16-bit files at full precision by reading with IMREAD_UNCHANGED
-    and scaling 16-bit values into [0, 255] (divide by 257). 8-bit files and
-    pre-loaded arrays are handled without precision loss.
+    16-bit files/arrays are returned in [0, 65535]; 8-bit in [0, 255]. The
+    range is not normalised so callers that need to know the scale should
+    check the source dtype beforehand via _source_depth.
+    Raises ValueError if cv2 cannot read the file.
     """
     if isinstance(path, np.ndarray):
         img = path.astype(np.float32)
-        if path.dtype == np.uint16:
-            img /= 257.0
     else:
         raw = cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         if raw is None:
-            img = np.array(Image.open(path).convert("RGB"), dtype=np.float32)
-        else:
-            if raw.ndim == 2:
-                raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
-            elif raw.shape[2] == 4:
-                raw = raw[:, :, :3]
-            # cv2 loads as BGR; convert to RGB
-            raw = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
-            if raw.dtype == np.uint16:
-                img = raw.astype(np.float32) / 257.0
-            else:
-                img = raw.astype(np.float32)
+            raise ValueError(f"cv2 could not read image: '{path}'")
+        if raw.ndim == 2:
+            raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
+        elif raw.shape[2] == 4:
+            raw = raw[:, :, :3]
+        raw = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+        img = raw.astype(np.float32)
     if img.shape[1] != size[0] or img.shape[0] != size[1]:
         img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
     return img
@@ -946,9 +949,16 @@ def stack_images(
 ) -> np.ndarray:
     """Fuse a stack of images using single-pass unnormalized Laplacian pyramid fusion.
 
-    Accumulates energy-weighted Lab bands and energy sums in one disk read per
-    image, then divides at the end. Mathematically identical to normalized fusion:
+    Accumulates energy-weighted RGB bands and energy sums in one disk read per
+    image, then divides at the end. Focus weights are derived from the Lab
+    Laplacian pyramid so colour does not influence sharpness scoring, but the
+    blended pixel values come from the original RGB data preserving full depth.
+
+    Mathematically identical to normalized fusion:
       Σ(e_k / Σe_k · x_k) = Σ(e_k · x_k) / Σe_k
+
+    The output dtype matches the source depth: uint16 for 16-bit sources,
+    uint8 for 8-bit sources. Depth is detected from the first image/array.
 
     canvas_size overrides the output dimensions (w, h). If None, the size of the
     first image is used (equivalent to --keep-size behaviour).
@@ -967,12 +977,16 @@ def stack_images(
 
     interrupt is called after each image is fused; if it returns True, Interrupted is raised.
     """
+    depth = _source_depth(src_paths[0])
+    max_val = 65535.0 if depth == 16 else 255.0
+    out_dtype = np.uint16 if depth == 16 else np.uint8
+
     if isinstance(src_paths[0], np.ndarray):
         h, w = src_paths[0].shape[:2]
     else:
-        probe = cv2.imread(str(src_paths[0]), cv2.IMREAD_COLOR)
+        probe = cv2.imread(str(src_paths[0]), cv2.IMREAD_UNCHANGED)
         if probe is None:
-            probe = np.array(Image.open(src_paths[0]).convert("RGB"), dtype=np.uint8)
+            raise ValueError(f"cv2 could not read image: '{src_paths[0]}'")
         h, w = probe.shape[:2]
         del probe
     cv2_size = canvas_size if canvas_size is not None else (w, h)
@@ -985,101 +999,182 @@ def stack_images(
 
     PartialAccum = tuple[list[np.ndarray], list[np.ndarray]]
 
-    def _process_batch(batch: list[tuple[Path | np.ndarray, np.ndarray]]) -> PartialAccum:
-        local_energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
-        local_fused_lp: list[np.ndarray | None] = [None] * (levels + 1)
-        local_wb: np.ndarray | None = None
+    if depth == 16:
+        warp_dtype: type = np.uint16
 
-        for path, warp in batch:
-            img = _load_raw(path, cv2_size)
+        def _pixel_lap_pyramid(img: np.ndarray) -> list[np.ndarray]:
+            """Laplacian pyramid over float32 RGB in [0, 65535]."""
+            bands: list[np.ndarray] = []
+            current = img
+            for _ in range(levels):
+                h_c, w_c = current.shape[:2]
+                nh, nw = (h_c + 1) // 2, (w_c + 1) // 2
+                smoothed = cv2.sepFilter2D(current, cv2.CV_32F, _K1D, _K1D,
+                                           borderType=cv2.BORDER_REFLECT)
+                nxt = smoothed[::2, ::2, :].copy()
+                up = np.zeros((nh * 2, nw * 2, 3), dtype=np.float32)
+                up[::2, ::2, :] = nxt
+                exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
+                                      borderType=cv2.BORDER_REFLECT)
+                current = current - exp[:h_c, :w_c, :]
+                bands.append(current)
+                current = nxt
+            bands.append(current)
+            return bands
 
-            if not np.array_equal(warp, identity_warp):
-                u8 = np.clip(img, 0, 255).astype(np.uint8)
-                flags = cv2.INTER_LINEAR if _is_pure_translation(warp) else cv2.INTER_CUBIC
-                img = cv2.warpAffine(u8, warp, cv2_size, flags=flags,
-                                     borderMode=border_mode).astype(np.float32)
+        def _process_batch(batch: list[tuple[Path | np.ndarray, np.ndarray]]) -> PartialAccum:
+            """16-bit: blend RGB pyramid bands; derive focus weights from Lab."""
+            local_energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
+            local_fused: list[np.ndarray | None] = [None] * (levels + 1)
+            local_wb: np.ndarray | None = None
 
-            lab = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8),
-                               cv2.COLOR_RGB2Lab).astype(np.float32)
-            del img
+            for path, warp in batch:
+                img = _load_raw(path, cv2_size)
 
-            lap = _lab_lap_pyramid(lab, levels)
-            del lab
+                if not np.array_equal(warp, identity_warp):
+                    clamped = np.clip(img, 0, max_val).astype(warp_dtype)
+                    flags = cv2.INTER_LINEAR if _is_pure_translation(warp) else cv2.INTER_CUBIC
+                    img = cv2.warpAffine(clamped, warp, cv2_size, flags=flags,
+                                         borderMode=border_mode).astype(np.float32)
 
-            energies: list[np.ndarray] = []
-            for i in range(levels):
-                energies.append(region_energy(lap[i][:, :, 0]) ** sharpness)
-            lv = lap[-1][:, :, 0]
-            energies.append(((region_deviation(lv) + region_entropy(lv)) * 0.5) ** sharpness)
+                lab = _image_to_lab(img, max_val)
+                lab_lap = _lab_lap_pyramid(lab, levels)
+                del lab
+                pixel_lap = _pixel_lap_pyramid(img)
+                del img
 
-            for i in range(levels + 1):
-                e = energies[i]
-                band = lap[i]
-                lap[i] = None  # type: ignore[call-overload]
-                local_energy_sums[i] = e if local_energy_sums[i] is None else local_energy_sums[i] + e
-                if local_wb is None or local_wb.shape != band.shape:
-                    local_wb = np.empty_like(band)
-                np.multiply(band, e[:, :, np.newaxis], out=local_wb)
-                if local_fused_lp[i] is None:
-                    local_fused_lp[i] = local_wb.copy()
-                else:
-                    local_fused_lp[i] += local_wb  # type: ignore[operator]
+                energies: list[np.ndarray] = []
+                for i in range(levels):
+                    energies.append(region_energy(lab_lap[i][:, :, 0]) ** sharpness)
+                lv = lab_lap[-1][:, :, 0]
+                energies.append(((region_deviation(lv) + region_entropy(lv)) * 0.5) ** sharpness)
 
-        return local_energy_sums, local_fused_lp  # type: ignore[return-value]
+                for i in range(levels + 1):
+                    e = energies[i]
+                    band = pixel_lap[i]
+                    pixel_lap[i] = None  # type: ignore[call-overload]
+                    local_energy_sums[i] = e if local_energy_sums[i] is None else local_energy_sums[i] + e
+                    if local_wb is None or local_wb.shape != band.shape:
+                        local_wb = np.empty_like(band)
+                    np.multiply(band, e[:, :, np.newaxis], out=local_wb)
+                    if local_fused[i] is None:
+                        local_fused[i] = local_wb.copy()
+                    else:
+                        local_fused[i] += local_wb  # type: ignore[operator]
+
+            return local_energy_sums, local_fused  # type: ignore[return-value]
+
+        def _reconstruct(fused: list[np.ndarray]) -> np.ndarray:
+            image = fused[-1].copy()
+            for band in reversed(fused[:-1]):
+                cur_shape = band.shape[:2]
+                h_i, w_i = image.shape[:2]
+                up = np.zeros((h_i * 2, w_i * 2, 3), dtype=np.float32)
+                up[::2, ::2, :] = image
+                exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
+                                      borderType=cv2.BORDER_REFLECT)
+                image = exp[: cur_shape[0], : cur_shape[1], :] + band  # type: ignore[operator]
+            return _suppress_dark_chroma_rgb(image, dark_threshold, max_val)
+
+    else:
+        def _process_batch(batch: list[tuple[Path | np.ndarray, np.ndarray]]) -> PartialAccum:  # type: ignore[misc]
+            """8-bit: blend Lab pyramid bands directly (no precision lost vs 8-bit source).
+
+            Loads files with IMREAD_COLOR (faster than IMREAD_ANYDEPTH for 8-bit)
+            and keeps data as uint8 until the cvtColor call, matching the original
+            pipeline exactly.
+            """
+            local_energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
+            local_fused: list[np.ndarray | None] = [None] * (levels + 1)
+            local_wb: np.ndarray | None = None
+
+            for path, warp in batch:
+                img = _load_raw_u8(path, cv2_size)
+
+                if not np.array_equal(warp, identity_warp):
+                    flags = cv2.INTER_LINEAR if _is_pure_translation(warp) else cv2.INTER_CUBIC
+                    img = cv2.warpAffine(img, warp, cv2_size, flags=flags,
+                                         borderMode=border_mode)
+
+                lab = cv2.cvtColor(img, cv2.COLOR_RGB2Lab).astype(np.float32)
+                del img
+                lab_lap = _lab_lap_pyramid(lab, levels)
+                del lab
+
+                energies: list[np.ndarray] = []
+                for i in range(levels):
+                    energies.append(region_energy(lab_lap[i][:, :, 0]) ** sharpness)
+                lv = lab_lap[-1][:, :, 0]
+                energies.append(((region_deviation(lv) + region_entropy(lv)) * 0.5) ** sharpness)
+
+                for i in range(levels + 1):
+                    e = energies[i]
+                    band = lab_lap[i]
+                    lab_lap[i] = None  # type: ignore[call-overload]
+                    local_energy_sums[i] = e if local_energy_sums[i] is None else local_energy_sums[i] + e
+                    if local_wb is None or local_wb.shape != band.shape:
+                        local_wb = np.empty_like(band)
+                    np.multiply(band, e[:, :, np.newaxis], out=local_wb)
+                    if local_fused[i] is None:
+                        local_fused[i] = local_wb.copy()
+                    else:
+                        local_fused[i] += local_wb  # type: ignore[operator]
+
+            return local_energy_sums, local_fused  # type: ignore[return-value]
+
+        def _reconstruct(fused: list[np.ndarray]) -> np.ndarray:  # type: ignore[misc]
+            image = fused[-1].copy()
+            for band in reversed(fused[:-1]):
+                cur_shape = band.shape[:2]
+                h_i, w_i = image.shape[:2]
+                up = np.zeros((h_i * 2, w_i * 2, 3), dtype=np.float32)
+                up[::2, ::2, :] = image
+                exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
+                                      borderType=cv2.BORDER_REFLECT)
+                image = exp[: cur_shape[0], : cur_shape[1], :] + band  # type: ignore[operator]
+            fused_lab = _suppress_dark_chroma(image, dark_threshold)
+            return cv2.cvtColor(np.clip(fused_lab, 0, 255).astype(np.uint8),
+                                cv2.COLOR_Lab2RGB)
 
     if progress is not None:
         progress(0.0, "stacking", f"Fusing ({n_workers} workers)...")
     energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
-    fused_lp: list[np.ndarray | None] = [None] * (levels + 1)
+    fused: list[np.ndarray | None] = [None] * (levels + 1)
 
     items = list(zip(src_paths, warps))
 
     # Distribute images across workers as evenly as possible so each worker
-    # accumulates its own partial fused_lp/energy_sums. The main thread then
+    # accumulates its own partial fused/energy_sums. The main thread then
     # merges n_workers partial results instead of accumulating all n images serially.
     chunk_size = max(1, (len(items) + n_workers - 1) // n_workers)
     batches = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
-    fused = 0
+    done_count = 0
 
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_process_batch, batch): batch for batch in batches}
-        for done in as_completed(futures):
-            partial_energy, partial_fused = done.result()
+        for future in as_completed(futures):
+            partial_energy, partial_fused = future.result()
 
             for i in range(levels + 1):
                 energy_sums[i] = (partial_energy[i] if energy_sums[i] is None
                                   else energy_sums[i] + partial_energy[i])  # type: ignore[operator]
-                fused_lp[i] = (partial_fused[i] if fused_lp[i] is None
-                               else fused_lp[i] + partial_fused[i])  # type: ignore[operator]
+                fused[i] = (partial_fused[i] if fused[i] is None
+                            else fused[i] + partial_fused[i])  # type: ignore[operator]
 
-            batch_size = len(futures[done])
-            fused += batch_size
+            done_count += len(futures[future])
             if progress is not None:
-                progress(fused / n * 0.7, "stacking", f"Fused image {fused}/{n}")
+                progress(done_count / n * 0.7, "stacking", f"Fused image {done_count}/{n}")
             if interrupt is not None and interrupt():
                 raise Interrupted
 
     for i in range(levels + 1):
-        fused_lp[i] /= energy_sums[i][:, :, np.newaxis] + 1e-10  # type: ignore[operator,index]
+        fused[i] /= energy_sums[i][:, :, np.newaxis] + 1e-10  # type: ignore[operator,index]
 
     if progress is not None:
         progress(0.8, "stacking", "Reconstructing pyramid...")
-    image = fused_lp[-1].copy()  # type: ignore[union-attr]
-    for band in reversed(fused_lp[:-1]):
-        cur_shape = band.shape[:2]  # type: ignore[union-attr]
-        h, w = image.shape[:2]
-        up = np.zeros((h * 2, w * 2, 3), dtype=np.float32)
-        up[::2, ::2, :] = image
-        exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
-                              borderType=cv2.BORDER_REFLECT)
-        image = exp[: cur_shape[0], : cur_shape[1], :] + band  # type: ignore[operator]
-    fused_lab = image
-
-    if progress is not None:
-        progress(0.9, "stacking", "Colour correction...")
-    fused_lab = _suppress_dark_chroma(fused_lab, dark_threshold)
-    result = cv2.cvtColor(np.clip(fused_lab, 0, 255).astype(np.uint8), cv2.COLOR_Lab2RGB)
+    image = _reconstruct(fused)  # type: ignore[arg-type]
+    result = np.clip(image, 0, max_val).astype(out_dtype)
 
     if progress is not None:
         progress(1.0, "stacking", "Stacking complete")
@@ -1088,13 +1183,10 @@ def stack_images(
 
 
 def _suppress_dark_chroma(fused_lab: np.ndarray, threshold: float) -> np.ndarray:
-    """Lerp a/b channels toward neutral (128) in dark regions.
+    """Lerp a/b channels toward neutral (128) in dark regions (8-bit Lab path).
 
     In Lab (OpenCV uint8 encoding) a neutral/achromatic pixel has a=128, b=128.
-    Floating point drift during pyramid reconstruction can push dark pixels away
-    from neutral, producing visible color casts in areas that should be black.
-    The mask is 0 where L=0 and ramps linearly to 1 at L=threshold, clamped
-    to 1 above that, so only genuinely dark pixels are affected.
+    The mask ramps from 0 where L=0 to 1 at L=threshold, clamped to 1 above.
     """
     l = fused_lab[:, :, 0]
     mask = np.clip(l / (threshold + 1e-10), 0.0, 1.0)
@@ -1102,6 +1194,25 @@ def _suppress_dark_chroma(fused_lab: np.ndarray, threshold: float) -> np.ndarray
     result[:, :, 1] = 128.0 + (fused_lab[:, :, 1] - 128.0) * mask
     result[:, :, 2] = 128.0 + (fused_lab[:, :, 2] - 128.0) * mask
     return result
+
+
+def _suppress_dark_chroma_rgb(rgb: np.ndarray, threshold: float, max_val: float) -> np.ndarray:
+    """Lerp RGB channels toward achromatic in dark regions.
+
+    Floating point drift during pyramid reconstruction can introduce colour
+    casts in pixels that should be near-black. The luminance of each pixel is
+    estimated as a weighted sum of R, G, B (Rec. 709 coefficients). threshold
+    is in [0, 255] L units; it is scaled by max_val/255 to match the working
+    range of rgb. The mask ramps from 0 at luminance=0 to 1 at
+    luminance=threshold_scaled, clamped to 1 above. Below the threshold each
+    pixel is lerped toward its own grey level so hue is suppressed without
+    changing perceived brightness.
+    """
+    threshold_scaled = threshold * (max_val / 255.0)
+    lum = (0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2])
+    mask = np.clip(lum / (threshold_scaled + 1e-10), 0.0, 1.0)[:, :, np.newaxis]
+    grey = lum[:, :, np.newaxis]
+    return grey + (rgb - grey) * mask
 
 
 def compute_levels(shape: tuple[int, int], max_levels: int = 6) -> int:
@@ -1254,7 +1365,7 @@ def run(
     """Run the full focus stacking pipeline and return the result.
 
     Returns a RunResult with:
-      - image: uint8 RGB ndarray of the stacked image, or None when only_slab is True.
+      - image: uint8 or uint16 RGB ndarray matching the source bit depth, or None when only_slab is True.
       - slabs: list of intermediate slab arrays when only_slab is True, else None.
 
     progress is called throughout as progress(fraction, stage, message) where fraction

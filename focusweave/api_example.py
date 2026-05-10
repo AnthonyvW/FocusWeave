@@ -4,24 +4,51 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
-from PIL import Image
 
 from focusweave.focus_stack import IMAGE_EXTENSIONS, FocusStackConfig, RunResult, run
 
 
 def load_folder(folder: Path) -> list[np.ndarray]:
+    """Load all images in folder as RGB ndarrays at native bit depth.
+
+    Uses cv2 with IMREAD_ANYDEPTH so 16-bit files are returned as uint16
+    and 8-bit files as uint8. Mixed-depth folders are not supported; all
+    images should share the same bit depth.
+    """
     paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
     if len(paths) < 2:
         raise ValueError(f"Need at least 2 images in '{folder}', found {len(paths)}.")
-    return [np.array(Image.open(p).convert("RGB")) for p in paths]
+    images: list[np.ndarray] = []
+    for p in paths:
+        raw = cv2.imread(str(p), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+        if raw is None:
+            raise ValueError(f"cv2 could not read image: '{p}'")
+        if raw.ndim == 2:
+            raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
+        elif raw.shape[2] == 4:
+            raw = raw[:, :, :3]
+        images.append(cv2.cvtColor(raw, cv2.COLOR_BGR2RGB))
+    return images
 
 
 def save_image(img: np.ndarray, path: Path, quality: int = 95) -> None:
-    fmt = path.suffix.lower().lstrip(".")
-    fmt = "jpeg" if fmt in ("jpg", "jpeg") else fmt.upper()
-    save_kwargs: dict = {"quality": quality} if fmt == "jpeg" else {}
-    Image.fromarray(img).save(path, fmt, **save_kwargs)
+    """Save a uint8 or uint16 RGB ndarray to path.
+
+    JPEG and WebP do not support 16-bit depth; uint16 images are converted to
+    uint8 before saving to those formats. All other formats (PNG, TIFF, etc.)
+    retain full 16-bit depth when the array is uint16.
+    """
+    suffix = path.suffix.lower()
+    low_depth_formats = {".jpg", ".jpeg", ".webp"}
+    if img.dtype == np.uint16 and suffix in low_depth_formats:
+        img = (img >> 8).astype(np.uint8)
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    params: list[int] = []
+    if suffix in (".jpg", ".jpeg"):
+        params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    cv2.imwrite(str(path), bgr, params)
 
 
 def stack(
