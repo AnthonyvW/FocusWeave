@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['focusweave\\main.py'],
+    ['focusweave/main.py'],
     pathex=[],
     binaries=[],
     datas=[],
