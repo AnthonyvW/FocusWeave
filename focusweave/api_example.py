@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from focusweave.focus_stack import IMAGE_EXTENSIONS, FocusStackConfig, RunResult, run
+from focusweave.streaming_stack import StreamingFocusStacker
 
 
 def load_folder(folder: Path) -> list[np.ndarray]:
@@ -105,6 +106,79 @@ def stack(
     return result
 
 
+def stack_streaming(
+    images: list[np.ndarray],
+    output: Path,
+    reference_size: tuple[int, int],
+    workers: int = 3,
+    quality: int = 95,
+    cull_threshold: float | None = None,
+    keep_size: bool = False,
+    slab: tuple[int, int] | None = None,
+    output_steps: bool = False,
+    only_slab: bool = False,
+    recursive_slab: bool = False,
+    slab_format: str | None = None,
+) -> RunResult:
+    """Focus stack a sequence of images using StreamingFocusStacker.
+
+    Images are fed to the stacker one at a time in acquisition order, with
+    culling scores and pairwise alignment computed as each image is added.
+    This mirrors how the stacker would be used when images are captured
+    incrementally: replace the for-loop here with your acquisition loop and
+    call stacker.add_image() as each frame arrives.
+    """
+    emit_steps = output_steps or only_slab
+    steps_dir = output.parent / "focusweave_slabs" if emit_steps else None
+    final_ext = slab_format.lstrip(".") if slab_format else "tiff"
+
+    def _on_slab(label: str, array: np.ndarray) -> None:
+        assert steps_dir is not None
+        steps_dir.mkdir(parents=True, exist_ok=True)
+        slab_file = steps_dir / f"{label}.{final_ext}"
+        t = time.perf_counter()
+        save_image(array, slab_file, quality)
+        print(f"    Saved: {slab_file} ({time.perf_counter() - t:.2f}s)")
+
+    stacker = StreamingFocusStacker(
+        reference_size=reference_size,
+        cull_threshold=cull_threshold,
+        workers=workers,
+        slab=slab,
+        only_slab=only_slab,
+        recursive_slab=recursive_slab,
+        on_slab=_on_slab if emit_steps else None,
+    )
+
+    def _progress(fraction: float, stage: str, message: str) -> None:
+        if message:
+            print(f"  {fraction * 100:5.1f}%  {message}")
+
+    t_start = time.perf_counter()
+    for image in images:
+        stacker.add_image(image)
+    t_acquired = time.perf_counter()
+    print(f"Acquisition phase done ({t_acquired - t_start:.2f}s — culling and alignment complete)")
+
+    print("Stacking...")
+    result = stacker.finish(keep_size=keep_size, progress=_progress)
+    t_stacked = time.perf_counter()
+    print(f"Stacking done ({t_stacked - t_acquired:.2f}s)")
+
+    if result.slabs is not None:
+        if steps_dir is not None:
+            print(f"Slabs saved to: {steps_dir}")
+        print(f"Done ({t_stacked - t_start:.2f}s total)")
+        return result
+
+    t_save = time.perf_counter()
+    save_image(result.image, output, quality)  # type: ignore[arg-type]
+    print(f"Saved: {output} ({time.perf_counter() - t_save:.2f}s)")
+    print(f"Done ({time.perf_counter() - t_start:.2f}s total)")
+
+    return result
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -171,20 +245,65 @@ if __name__ == "__main__":
             "Defaults to tiff when not specified. Requires --output-steps or --only-slab."
         ),
     )
+    parser.add_argument(
+        "--streaming", action="store_true",
+        help=(
+            "Use StreamingFocusStacker instead of the standard pipeline. "
+            "Images are loaded and aligned one at a time to simulate incremental acquisition."
+        ),
+    )
+    parser.add_argument(
+        "--cull", type=float, nargs="?", const=0.6, default=None,
+        metavar="THRESHOLD",
+        help=(
+            "Remove wholly out-of-focus images before stacking (streaming mode only). "
+            "THRESHOLD defaults to 0.6 when --cull is given without a value."
+        ),
+    )
+    parser.add_argument(
+        "--keep-size", action="store_true",
+        help=(
+            "Keep the output image the same size as the input images. "
+            "Warps are applied in-place rather than expanding the canvas (streaming mode only)."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.folder.is_dir():
         print(f"Error: '{args.folder}' is not a directory.")
         sys.exit(1)
 
-    stack(
-        folder=args.folder,
-        output=args.output,
-        workers=args.workers,
-        quality=args.quality,
-        slab=tuple(args.slab) if args.slab is not None else None,  # type: ignore[arg-type]
-        output_steps=args.output_steps,
-        only_slab=args.only_slab,
-        recursive_slab=args.recursive_slab,
-        slab_format=args.slab_format,
-    )
+    slab = tuple(args.slab) if args.slab is not None else None  # type: ignore[arg-type]
+
+    if args.streaming:
+        print(f"Loading images from {args.folder}...")
+        images = load_folder(args.folder)
+        print(f"Loaded {len(images)} images.")
+        h, w = images[0].shape[:2]
+        out_path = args.output if args.output is not None else args.folder / "stacked_streaming.jpg"
+        stack_streaming(
+            images=images,
+            output=out_path,
+            reference_size=(w, h),
+            workers=args.workers,
+            quality=args.quality,
+            cull_threshold=args.cull,
+            keep_size=args.keep_size,
+            slab=slab,
+            output_steps=args.output_steps,
+            only_slab=args.only_slab,
+            recursive_slab=args.recursive_slab,
+            slab_format=args.slab_format,
+        )
+    else:
+        stack(
+            folder=args.folder,
+            output=args.output,
+            workers=args.workers,
+            quality=args.quality,
+            slab=slab,
+            output_steps=args.output_steps,
+            only_slab=args.only_slab,
+            recursive_slab=args.recursive_slab,
+            slab_format=args.slab_format,
+        )
