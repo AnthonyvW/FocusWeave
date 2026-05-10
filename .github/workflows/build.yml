@@ -13,11 +13,11 @@ jobs:
           - os: windows-latest
             artifact_name: FocusWeave-windows
             built_path: dist/FocusWeave.exe
-            release_name: FocusWeave-windows.exe
+            release_name: FocusWeave.exe
           - os: ubuntu-latest
             artifact_name: FocusWeave-linux
             built_path: dist/FocusWeave
-            release_name: FocusWeave-linux
+            release_name: FocusWeave
 
     runs-on: ${{ matrix.os }}
 

@@ -20,3 +20,7 @@ from focusweave.focus_stack import (
     slab_images,
     stack_images,
 )
+from focusweave.streaming_stack import (
+    PreviewCallback,
+    StreamingFocusStacker,
+)

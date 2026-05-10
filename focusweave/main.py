@@ -9,7 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from focusweave.focus_stack import IMAGE_EXTENSIONS, FocusStackConfig, Interrupted, run
+from focus_stack import IMAGE_EXTENSIONS, FocusStackConfig, Interrupted, run
 
 
 def _get_version() -> str:

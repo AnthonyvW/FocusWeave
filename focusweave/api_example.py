@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from focusweave.focus_stack import IMAGE_EXTENSIONS, FocusStackConfig, RunResult, run
-from focusweave.streaming_stack import StreamingFocusStacker
+from focusweave.streaming_stack import PreviewCallback, StreamingFocusStacker
 
 
 def load_folder(folder: Path) -> list[np.ndarray]:
@@ -112,6 +112,7 @@ def stack_streaming(
     reference_size: tuple[int, int],
     workers: int = 3,
     quality: int = 95,
+    reference: int = -1,
     cull_threshold: float | None = None,
     keep_size: bool = False,
     slab: tuple[int, int] | None = None,
@@ -119,6 +120,8 @@ def stack_streaming(
     only_slab: bool = False,
     recursive_slab: bool = False,
     slab_format: str | None = None,
+    on_preview: PreviewCallback | None = None,
+    preview_scale: float = 0.25,
 ) -> RunResult:
     """Focus stack a sequence of images using StreamingFocusStacker.
 
@@ -127,6 +130,11 @@ def stack_streaming(
     This mirrors how the stacker would be used when images are captured
     incrementally: replace the for-loop here with your acquisition loop and
     call stacker.add_image() as each frame arrives.
+
+    on_preview is called as on_preview(rgb_array, image_count) after each
+    image is added, with a uint8 RGB partial stack at preview_scale resolution.
+    Pass a directory path via the CLI (--preview-dir) to save frames to disk,
+    or supply your own callback here to display or stream them elsewhere.
     """
     emit_steps = output_steps or only_slab
     steps_dir = output.parent / "focusweave_slabs" if emit_steps else None
@@ -140,19 +148,22 @@ def stack_streaming(
         save_image(array, slab_file, quality)
         print(f"    Saved: {slab_file} ({time.perf_counter() - t:.2f}s)")
 
+    def _progress(fraction: float, stage: str, message: str) -> None:
+        if message:
+            print(f"  {fraction * 100:5.1f}%  {message}")
+
     stacker = StreamingFocusStacker(
         reference_size=reference_size,
+        reference=reference,
         cull_threshold=cull_threshold,
         workers=workers,
         slab=slab,
         only_slab=only_slab,
         recursive_slab=recursive_slab,
         on_slab=_on_slab if emit_steps else None,
+        on_preview=on_preview,
+        preview_scale=preview_scale,
     )
-
-    def _progress(fraction: float, stage: str, message: str) -> None:
-        if message:
-            print(f"  {fraction * 100:5.1f}%  {message}")
 
     t_start = time.perf_counter()
     for image in images:
@@ -160,10 +171,15 @@ def stack_streaming(
     t_acquired = time.perf_counter()
     print(f"Acquisition phase done ({t_acquired - t_start:.2f}s — culling and alignment complete)")
 
+    stacker.flush_preview()
+    t_flushed = time.perf_counter()
+    if t_flushed - t_acquired > 0.05:
+        print(f"Preview flush done ({t_flushed - t_acquired:.2f}s)")
+
     print("Stacking...")
     result = stacker.finish(keep_size=keep_size, progress=_progress)
     t_stacked = time.perf_counter()
-    print(f"Stacking done ({t_stacked - t_acquired:.2f}s)")
+    print(f"Stacking done ({t_stacked - t_flushed:.2f}s)")
 
     if result.slabs is not None:
         if steps_dir is not None:
@@ -174,7 +190,7 @@ def stack_streaming(
     t_save = time.perf_counter()
     save_image(result.image, output, quality)  # type: ignore[arg-type]
     print(f"Saved: {output} ({time.perf_counter() - t_save:.2f}s)")
-    print(f"Done ({time.perf_counter() - t_start:.2f}s total)")
+    print(f"Done ({t_stacked - t_start:.2f}s total)")
 
     return result
 
@@ -253,6 +269,13 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--reference", type=int, default=-1,
+        help=(
+            "Index of the image to use as the alignment reference, 0-based "
+            "(default: middle image). Only applies in streaming mode."
+        ),
+    )
+    parser.add_argument(
         "--cull", type=float, nargs="?", const=0.6, default=None,
         metavar="THRESHOLD",
         help=(
@@ -265,6 +288,22 @@ if __name__ == "__main__":
         help=(
             "Keep the output image the same size as the input images. "
             "Warps are applied in-place rather than expanding the canvas (streaming mode only)."
+        ),
+    )
+    parser.add_argument(
+        "--preview-dir", type=Path, default=None, metavar="DIR",
+        help=(
+            "Save a partial focus stack preview after each image is added. "
+            "Frames are written to DIR as preview_NNN.jpg, where NNN is the image count. "
+            "Only applies in streaming mode."
+        ),
+    )
+    parser.add_argument(
+        "--preview-scale", type=float, default=0.25, metavar="SCALE",
+        help=(
+            "Resolution of preview frames as a fraction of the source size "
+            "(default: 0.25). Lower values are faster; 1.0 is full resolution. "
+            "Only applies when --preview-dir is set."
         ),
     )
     args = parser.parse_args()
@@ -281,12 +320,25 @@ if __name__ == "__main__":
         print(f"Loaded {len(images)} images.")
         h, w = images[0].shape[:2]
         out_path = args.output if args.output is not None else args.folder / "stacked_streaming.jpg"
+
+        on_preview: PreviewCallback | None = None
+        if args.preview_dir is not None:
+            preview_dir = args.preview_dir
+            preview_quality = args.quality
+
+            def on_preview(frame: np.ndarray, count: int) -> None:
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                path = preview_dir / f"preview_{count:03d}.jpg"
+                save_image(frame, path, preview_quality)
+                print(f"  Preview: {path}")
+
         stack_streaming(
             images=images,
             output=out_path,
             reference_size=(w, h),
             workers=args.workers,
             quality=args.quality,
+            reference=args.reference,
             cull_threshold=args.cull,
             keep_size=args.keep_size,
             slab=slab,
@@ -294,6 +346,8 @@ if __name__ == "__main__":
             only_slab=args.only_slab,
             recursive_slab=args.recursive_slab,
             slab_format=args.slab_format,
+            on_preview=on_preview,
+            preview_scale=args.preview_scale,
         )
     else:
         stack(
