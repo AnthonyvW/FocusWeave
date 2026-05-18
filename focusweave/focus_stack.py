@@ -940,7 +940,6 @@ def stack_images(
     warps: list[np.ndarray],
     levels: int,
     sharpness: float,
-    dark_threshold: float,
     canvas_size: tuple[int, int] | None = None,
     no_fill: bool = False,
     workers: int = 3,
@@ -997,7 +996,8 @@ def stack_images(
 
     identity_warp = np.eye(2, 3, dtype=np.float32)
 
-    PartialAccum = tuple[list[np.ndarray], list[np.ndarray]]
+    # (energy_sums, weighted_band_sums, unweighted_band_sums, image_count)
+    PartialAccum = tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], int]
 
     if depth == 16:
         warp_dtype: type = np.uint16
@@ -1026,7 +1026,9 @@ def stack_images(
             """16-bit: blend RGB pyramid bands; derive focus weights from Lab."""
             local_energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
             local_fused: list[np.ndarray | None] = [None] * (levels + 1)
+            local_unweighted: list[np.ndarray | None] = [None] * (levels + 1)
             local_wb: np.ndarray | None = None
+            local_count = 0
 
             for path, warp in batch:
                 img = _load_raw(path, cv2_size)
@@ -1054,6 +1056,7 @@ def stack_images(
                     band = pixel_lap[i]
                     pixel_lap[i] = None  # type: ignore[call-overload]
                     local_energy_sums[i] = e if local_energy_sums[i] is None else local_energy_sums[i] + e
+                    local_unweighted[i] = band.copy() if local_unweighted[i] is None else local_unweighted[i] + band
                     if local_wb is None or local_wb.shape != band.shape:
                         local_wb = np.empty_like(band)
                     np.multiply(band, e[:, :, np.newaxis], out=local_wb)
@@ -1062,7 +1065,9 @@ def stack_images(
                     else:
                         local_fused[i] += local_wb  # type: ignore[operator]
 
-            return local_energy_sums, local_fused  # type: ignore[return-value]
+                local_count += 1
+
+            return local_energy_sums, local_fused, local_unweighted, local_count  # type: ignore[return-value]
 
         def _reconstruct(fused: list[np.ndarray]) -> np.ndarray:
             image = fused[-1].copy()
@@ -1074,19 +1079,36 @@ def stack_images(
                 exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
                                       borderType=cv2.BORDER_REFLECT)
                 image = exp[: cur_shape[0], : cur_shape[1], :] + band  # type: ignore[operator]
-            return _suppress_dark_chroma_rgb(image, dark_threshold, max_val)
+            return image
 
     else:
-        def _process_batch(batch: list[tuple[Path | np.ndarray, np.ndarray]]) -> PartialAccum:  # type: ignore[misc]
-            """8-bit: blend Lab pyramid bands directly (no precision lost vs 8-bit source).
+        def _pixel_lap_pyramid_u8(img: np.ndarray) -> list[np.ndarray]:
+            """Laplacian pyramid over float32 RGB in [0, 255]."""
+            bands: list[np.ndarray] = []
+            current = img
+            for _ in range(levels):
+                h_c, w_c = current.shape[:2]
+                nh, nw = (h_c + 1) // 2, (w_c + 1) // 2
+                smoothed = cv2.sepFilter2D(current, cv2.CV_32F, _K1D, _K1D,
+                                           borderType=cv2.BORDER_REFLECT)
+                nxt = smoothed[::2, ::2, :].copy()
+                up = np.zeros((nh * 2, nw * 2, 3), dtype=np.float32)
+                up[::2, ::2, :] = nxt
+                exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
+                                      borderType=cv2.BORDER_REFLECT)
+                current = current - exp[:h_c, :w_c, :]
+                bands.append(current)
+                current = nxt
+            bands.append(current)
+            return bands
 
-            Loads files with IMREAD_COLOR (faster than IMREAD_ANYDEPTH for 8-bit)
-            and keeps data as uint8 until the cvtColor call, matching the original
-            pipeline exactly.
-            """
+        def _process_batch(batch: list[tuple[Path | np.ndarray, np.ndarray]]) -> PartialAccum:  # type: ignore[misc]
+            """8-bit: blend RGB pyramid bands; derive focus weights from Lab."""
             local_energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
             local_fused: list[np.ndarray | None] = [None] * (levels + 1)
+            local_unweighted: list[np.ndarray | None] = [None] * (levels + 1)
             local_wb: np.ndarray | None = None
+            local_count = 0
 
             for path, warp in batch:
                 img = _load_raw_u8(path, cv2_size)
@@ -1096,10 +1118,13 @@ def stack_images(
                     img = cv2.warpAffine(img, warp, cv2_size, flags=flags,
                                          borderMode=border_mode)
 
-                lab = cv2.cvtColor(img, cv2.COLOR_RGB2Lab).astype(np.float32)
+                img_f = img.astype(np.float32)
                 del img
+                lab = cv2.cvtColor(img_f.clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2Lab).astype(np.float32)
                 lab_lap = _lab_lap_pyramid(lab, levels)
                 del lab
+                pixel_lap = _pixel_lap_pyramid_u8(img_f)
+                del img_f
 
                 energies: list[np.ndarray] = []
                 for i in range(levels):
@@ -1109,9 +1134,10 @@ def stack_images(
 
                 for i in range(levels + 1):
                     e = energies[i]
-                    band = lab_lap[i]
-                    lab_lap[i] = None  # type: ignore[call-overload]
+                    band = pixel_lap[i]
+                    pixel_lap[i] = None  # type: ignore[call-overload]
                     local_energy_sums[i] = e if local_energy_sums[i] is None else local_energy_sums[i] + e
+                    local_unweighted[i] = band.copy() if local_unweighted[i] is None else local_unweighted[i] + band
                     if local_wb is None or local_wb.shape != band.shape:
                         local_wb = np.empty_like(band)
                     np.multiply(band, e[:, :, np.newaxis], out=local_wb)
@@ -1120,7 +1146,9 @@ def stack_images(
                     else:
                         local_fused[i] += local_wb  # type: ignore[operator]
 
-            return local_energy_sums, local_fused  # type: ignore[return-value]
+                local_count += 1
+
+            return local_energy_sums, local_fused, local_unweighted, local_count  # type: ignore[return-value]
 
         def _reconstruct(fused: list[np.ndarray]) -> np.ndarray:  # type: ignore[misc]
             image = fused[-1].copy()
@@ -1132,14 +1160,14 @@ def stack_images(
                 exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
                                       borderType=cv2.BORDER_REFLECT)
                 image = exp[: cur_shape[0], : cur_shape[1], :] + band  # type: ignore[operator]
-            fused_lab = _suppress_dark_chroma(image, dark_threshold)
-            return cv2.cvtColor(np.clip(fused_lab, 0, 255).astype(np.uint8),
-                                cv2.COLOR_Lab2RGB)
+            return image
 
     if progress is not None:
         progress(0.0, "stacking", f"Fusing ({n_workers} workers)...")
     energy_sums: list[np.ndarray | None] = [None] * (levels + 1)
     fused: list[np.ndarray | None] = [None] * (levels + 1)
+    unweighted: list[np.ndarray | None] = [None] * (levels + 1)
+    total_count = 0
 
     items = list(zip(src_paths, warps))
 
@@ -1154,14 +1182,17 @@ def stack_images(
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_process_batch, batch): batch for batch in batches}
         for future in as_completed(futures):
-            partial_energy, partial_fused = future.result()
+            partial_energy, partial_fused, partial_unweighted, partial_count = future.result()
 
             for i in range(levels + 1):
                 energy_sums[i] = (partial_energy[i] if energy_sums[i] is None
                                   else energy_sums[i] + partial_energy[i])  # type: ignore[operator]
                 fused[i] = (partial_fused[i] if fused[i] is None
                             else fused[i] + partial_fused[i])  # type: ignore[operator]
+                unweighted[i] = (partial_unweighted[i] if unweighted[i] is None
+                                 else unweighted[i] + partial_unweighted[i])  # type: ignore[operator]
 
+            total_count += partial_count
             done_count += len(futures[future])
             if progress is not None:
                 progress(done_count / n * 0.7, "stacking", f"Fused image {done_count}/{n}")
@@ -1169,7 +1200,24 @@ def stack_images(
                 raise Interrupted
 
     for i in range(levels + 1):
-        fused[i] /= energy_sums[i][:, :, np.newaxis] + 1e-10  # type: ignore[operator,index]
+        e = energy_sums[i]  # type: ignore[index]
+        avg = unweighted[i] / total_count  # type: ignore[operator,index]
+        # Blend between unweighted average and energy-weighted result using a
+        # confidence weight derived from total energy. At featureless regions
+        # (flat white/black backgrounds) all images contribute near-zero sharpness
+        # energy, making the weighted numerator and denominator both near-zero but
+        # independently, so their ratio is unreliable noise. At weakly-textured
+        # regions the sharpness exponent (default 4.0) compresses small energy
+        # differences toward zero, making the weighting noise-dominated there too.
+        #
+        # The confidence alpha ramps from 0 (pure unweighted average) to 1 (pure
+        # energy-weighted) as total energy crosses a transition band. The midpoint
+        # 1e-8 corresponds to Laplacian magnitude ~0.1 on a 0-255 scale — just
+        # below any visually meaningful texture — and the width spans 4 decades so
+        # the transition is smooth and never produces a hard boundary artifact.
+        alpha = np.clip((np.log10(e + 1e-40) + 20.0) / 12.0, 0.0, 1.0)[:, :, np.newaxis]  # type: ignore[operator]
+        weighted = fused[i] / (e[:, :, np.newaxis] + 1e-40)  # type: ignore[operator,index]
+        fused[i] = alpha * weighted + (1.0 - alpha) * avg  # type: ignore[index]
 
     if progress is not None:
         progress(0.8, "stacking", "Reconstructing pyramid...")
@@ -1180,39 +1228,6 @@ def stack_images(
         progress(1.0, "stacking", "Stacking complete")
 
     return result
-
-
-def _suppress_dark_chroma(fused_lab: np.ndarray, threshold: float) -> np.ndarray:
-    """Lerp a/b channels toward neutral (128) in dark regions (8-bit Lab path).
-
-    In Lab (OpenCV uint8 encoding) a neutral/achromatic pixel has a=128, b=128.
-    The mask ramps from 0 where L=0 to 1 at L=threshold, clamped to 1 above.
-    """
-    l = fused_lab[:, :, 0]
-    mask = np.clip(l / (threshold + 1e-10), 0.0, 1.0)
-    result = fused_lab.copy()
-    result[:, :, 1] = 128.0 + (fused_lab[:, :, 1] - 128.0) * mask
-    result[:, :, 2] = 128.0 + (fused_lab[:, :, 2] - 128.0) * mask
-    return result
-
-
-def _suppress_dark_chroma_rgb(rgb: np.ndarray, threshold: float, max_val: float) -> np.ndarray:
-    """Lerp RGB channels toward achromatic in dark regions.
-
-    Floating point drift during pyramid reconstruction can introduce colour
-    casts in pixels that should be near-black. The luminance of each pixel is
-    estimated as a weighted sum of R, G, B (Rec. 709 coefficients). threshold
-    is in [0, 255] L units; it is scaled by max_val/255 to match the working
-    range of rgb. The mask ramps from 0 at luminance=0 to 1 at
-    luminance=threshold_scaled, clamped to 1 above. Below the threshold each
-    pixel is lerped toward its own grey level so hue is suppressed without
-    changing perceived brightness.
-    """
-    threshold_scaled = threshold * (max_val / 255.0)
-    lum = (0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2])
-    mask = np.clip(lum / (threshold_scaled + 1e-10), 0.0, 1.0)[:, :, np.newaxis]
-    grey = lum[:, :, np.newaxis]
-    return grey + (rgb - grey) * mask
 
 
 def compute_levels(shape: tuple[int, int], max_levels: int = 6) -> int:
@@ -1244,7 +1259,6 @@ def slab_images(
     overlap: int,
     levels: int,
     sharpness: float,
-    dark_threshold: float,
     canvas_size: tuple[int, int],
     no_fill: bool,
     workers: int,
@@ -1298,7 +1312,7 @@ def slab_images(
                 progress(idx / total_slabs, "slabbing", f"Stacking {label} (images {start + 1}–{end})")
             result = stack_images(
                 current_items[start:end], current_warps[start:end],
-                levels, sharpness, dark_threshold, current_canvas, no_fill, workers,
+                levels, sharpness, current_canvas, no_fill, workers,
             )
 
             if on_slab is not None:
@@ -1321,7 +1335,7 @@ def slab_images(
         if len(slab_arrays) <= slab_size or not recursive:
             final_warps = [identity.copy() for _ in slab_arrays]
             return stack_images(
-                slab_arrays, final_warps, levels, sharpness, dark_threshold,
+                slab_arrays, final_warps, levels, sharpness,
                 current_canvas, no_fill, workers, progress, interrupt,
             )
 
@@ -1349,7 +1363,6 @@ class FocusStackConfig:
     min_shift: float = 5.0
     levels: int = 0
     sharpness: float = 4.0
-    dark_threshold: float = 30.0
     workers: int = 3
     slab: tuple[int, int] | None = None
     only_slab: bool = False
@@ -1467,7 +1480,6 @@ def run(
             overlap=overlap,
             levels=levels,
             sharpness=cfg.sharpness,
-            dark_threshold=cfg.dark_threshold,
             canvas_size=canvas_size,
             no_fill=cfg.no_fill,
             workers=cfg.workers,
@@ -1486,7 +1498,7 @@ def run(
 
     _stage(0.30, "stacking", "Stacking...")
     result = stack_images(
-        src_images, adjusted_warps, levels, cfg.sharpness, cfg.dark_threshold,
+        src_images, adjusted_warps, levels, cfg.sharpness,
         canvas_size, cfg.no_fill, cfg.workers, _stack_progress, cfg.interrupt,
     )
 

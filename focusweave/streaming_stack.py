@@ -21,8 +21,6 @@ from focusweave.focus_stack import (
     _run_ecc,
     _score_map_to_scalar,
     _source_depth,
-    _suppress_dark_chroma,
-    _suppress_dark_chroma_rgb,
     _tenengrad_score_map,
     _to_gray_cv,
     compute_canvas,
@@ -88,7 +86,6 @@ class StreamingFocusStacker:
         min_shift: float = 5.0,
         levels: int = 0,
         sharpness: float = 4.0,
-        dark_threshold: float = 30.0,
         no_fill: bool = False,
         workers: int = 3,
         slab: tuple[int, int] | None = None,
@@ -109,7 +106,6 @@ class StreamingFocusStacker:
         self._min_shift = min_shift
         self._levels = levels
         self._sharpness = sharpness
-        self._dark_threshold = dark_threshold
         self._no_fill = no_fill
         self._workers = workers
         self._slab = slab
@@ -143,6 +139,7 @@ class StreamingFocusStacker:
         self._preview_depth: int = 8
         self._preview_energy_sums: list[np.ndarray] | None = None
         self._preview_fused: list[np.ndarray] | None = None
+        self._preview_unweighted: list[np.ndarray] | None = None
         self._preview_cumulative_warp: np.ndarray = np.eye(2, 3, dtype=np.float32)
 
 
@@ -292,7 +289,6 @@ class StreamingFocusStacker:
                 overlap=overlap,
                 levels=levels,
                 sharpness=self._sharpness,
-                dark_threshold=self._dark_threshold,
                 canvas_size=canvas_size,
                 no_fill=self._no_fill,
                 workers=self._workers,
@@ -307,7 +303,7 @@ class StreamingFocusStacker:
 
         result = stack_images(
             src_images, adjusted_warps, levels, self._sharpness,
-            self._dark_threshold, canvas_size, self._no_fill, self._workers,
+            canvas_size, self._no_fill, self._workers,
             progress,
         )
         return RunResult(image=result, slabs=None)
@@ -348,6 +344,7 @@ class StreamingFocusStacker:
             self._preview_levels = levels
             self._preview_energy_sums = [None] * (levels + 1)  # type: ignore[list-item]
             self._preview_fused = [None] * (levels + 1)  # type: ignore[list-item]
+            self._preview_unweighted = [None] * (levels + 1)  # type: ignore[list-item]
             self._preview_cumulative_warp = np.eye(2, 3, dtype=np.float32)
         else:
             levels = self._preview_levels
@@ -392,17 +389,21 @@ class StreamingFocusStacker:
                 if self._preview_energy_sums[i] is None:
                     self._preview_energy_sums[i] = e
                     self._preview_fused[i] = band * e[:, :, np.newaxis]
+                    self._preview_unweighted[i] = band.copy()
                 else:
                     self._preview_energy_sums[i] = self._preview_energy_sums[i] + e
                     self._preview_fused[i] = self._preview_fused[i] + band * e[:, :, np.newaxis]
+                    self._preview_unweighted[i] = self._preview_unweighted[i] + band
         else:
             img_u8 = _load_raw_u8(image, preview_size)
             if not np.array_equal(warp, identity_warp):
                 flags = cv2.INTER_LINEAR if _is_pure_translation(warp) else cv2.INTER_CUBIC
                 img_u8 = cv2.warpAffine(img_u8, warp, preview_size, flags=flags,
                                         borderMode=border_mode)
+            img_f = img_u8.astype(np.float32)
             lab = cv2.cvtColor(img_u8, cv2.COLOR_RGB2Lab).astype(np.float32)
             lab_lap = _lab_lap_pyramid(lab, levels)
+            pixel_lap = self._pixel_lap_pyramid_16(img_f, levels)
 
             energies = []
             for i in range(levels):
@@ -414,13 +415,15 @@ class StreamingFocusStacker:
 
             for i in range(levels + 1):
                 e = energies[i]
-                band = lab_lap[i]
+                band = pixel_lap[i]
                 if self._preview_energy_sums[i] is None:
                     self._preview_energy_sums[i] = e
                     self._preview_fused[i] = band * e[:, :, np.newaxis]
+                    self._preview_unweighted[i] = band.copy()
                 else:
                     self._preview_energy_sums[i] = self._preview_energy_sums[i] + e
                     self._preview_fused[i] = self._preview_fused[i] + band * e[:, :, np.newaxis]
+                    self._preview_unweighted[i] = self._preview_unweighted[i] + band
 
     def _reconstruct_preview(self) -> np.ndarray | None:
         """Reconstruct a uint8 RGB preview from the current accumulator state."""
@@ -428,38 +431,29 @@ class StreamingFocusStacker:
             return None
 
         levels = self._preview_levels
-        fused = [
-            self._preview_fused[i] / (self._preview_energy_sums[i][:, :, np.newaxis] + 1e-10)
-            for i in range(levels + 1)
-        ]
+        n_images = sum(1 for e in self._preview_energy_sums if e is not None)
+
+        fused: list[np.ndarray] = []
+        for i in range(levels + 1):
+            e = self._preview_energy_sums[i]
+            avg = self._preview_unweighted[i] / max(n_images, 1)
+            alpha = np.clip((np.log10(e + 1e-40) + 20.0) / 12.0, 0.0, 1.0)[:, :, np.newaxis]
+            weighted = self._preview_fused[i] / (e[:, :, np.newaxis] + 1e-40)
+            fused.append(alpha * weighted + (1.0 - alpha) * avg)
+
+        image = fused[-1].copy()
+        for band in reversed(fused[:-1]):
+            cur_shape = band.shape[:2]
+            h_i, w_i = image.shape[:2]
+            up = np.zeros((h_i * 2, w_i * 2, 3), dtype=np.float32)
+            up[::2, ::2, :] = image
+            exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
+                                  borderType=cv2.BORDER_REFLECT)
+            image = exp[: cur_shape[0], : cur_shape[1], :] + band
 
         if self._preview_depth == 16:
-            image = fused[-1].copy()
-            for band in reversed(fused[:-1]):
-                cur_shape = band.shape[:2]
-                h_i, w_i = image.shape[:2]
-                up = np.zeros((h_i * 2, w_i * 2, 3), dtype=np.float32)
-                up[::2, ::2, :] = image
-                exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
-                                      borderType=cv2.BORDER_REFLECT)
-                image = exp[: cur_shape[0], : cur_shape[1], :] + band
-            image = _suppress_dark_chroma_rgb(image, self._dark_threshold, 65535.0)
             return np.clip(image / 257.0, 0, 255).astype(np.uint8)
-        else:
-            image = fused[-1].copy()
-            for band in reversed(fused[:-1]):
-                cur_shape = band.shape[:2]
-                h_i, w_i = image.shape[:2]
-                up = np.zeros((h_i * 2, w_i * 2, 3), dtype=np.float32)
-                up[::2, ::2, :] = image
-                exp = cv2.sepFilter2D(up, cv2.CV_32F, _K1D_X2, _K1D_X2,
-                                      borderType=cv2.BORDER_REFLECT)
-                image = exp[: cur_shape[0], : cur_shape[1], :] + band
-            fused_lab = _suppress_dark_chroma(image, self._dark_threshold)
-            return cv2.cvtColor(
-                np.clip(fused_lab, 0, 255).astype(np.uint8),
-                cv2.COLOR_Lab2RGB,
-            )
+        return np.clip(image, 0, 255).astype(np.uint8)
 
     @staticmethod
     def _pixel_lap_pyramid_16(img: np.ndarray, levels: int) -> list[np.ndarray]:

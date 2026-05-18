@@ -159,15 +159,7 @@ def main() -> None:
             "Useful range is roughly 1.0 (soft) to 8.0 (near-hard)."
         ),
     )
-    parser.add_argument(
-        "--dark-threshold", type=float, default=30.0,
-        help=(
-            "Luminance threshold (0-255) below which chroma is suppressed toward neutral (default: 30.0). "
-            "Pixels with L below this value have their a/b channels lerped toward 128 (achromatic), "
-            "preventing color drift in dark/black regions caused by floating point reconstruction error. "
-            "Raise if color casts remain in shadows; lower if legitimate dark colors are being desaturated."
-        ),
-    )
+
     parser.add_argument(
         "--cull", type=float, nargs="?", const=0.6, default=None,
         metavar="THRESHOLD",
@@ -284,7 +276,6 @@ def main() -> None:
         min_shift=args.min_shift,
         levels=args.levels,
         sharpness=args.sharpness,
-        dark_threshold=args.dark_threshold,
         workers=args.workers,
         slab=tuple(args.slab) if args.slab is not None else None,  # type: ignore[arg-type]
         only_slab=args.only_slab,
