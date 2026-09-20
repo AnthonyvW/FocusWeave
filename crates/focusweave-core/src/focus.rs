@@ -2,7 +2,7 @@
 
 use crate::clahe::clahe;
 use crate::color::{cv_round, rgb_to_gray_u8};
-use crate::filter::{dilate_u8, ellipse_kernel, gaussian_blur, laplacian3, percentile, sobel};
+use crate::filter::{dilate_ellipse, gaussian_blur, laplacian3, percentile, sobel};
 use crate::hooks::{Error, Hooks, Stage};
 use crate::image_source::{load_u8, Source};
 use crate::mat::{Mat, MatU8};
@@ -210,7 +210,7 @@ pub fn focus_mask(gray: &MatU8, percentile_cut: f64) -> MatU8 {
             .map(|v| if *v >= cut { 255u8 } else { 0 })
             .collect(),
     };
-    dilate_u8(&mask, &ellipse_kernel(7, 7))
+    dilate_ellipse(&mask, 7, 7)
 }
 
 /// A frame prepared for ECC at one working resolution.

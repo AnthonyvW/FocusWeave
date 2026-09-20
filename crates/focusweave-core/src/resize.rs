@@ -86,6 +86,17 @@ fn axis_tabs(ssize: usize, dsize: usize) -> (Vec<Vec<Tap>>, bool) {
 
 /// Resize a float image to `(dst_w, dst_h)` using area averaging.
 pub fn resize_area(src: &Mat, dst_w: usize, dst_h: usize) -> Mat {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::resize_area(src, dst_w, dst_h)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        resize_area_native(src, dst_w, dst_h)
+    }
+}
+
+fn resize_area_native(src: &Mat, dst_w: usize, dst_h: usize) -> Mat {
     if src.w == dst_w && src.h == dst_h {
         return src.clone();
     }
@@ -126,6 +137,17 @@ pub fn resize_area(src: &Mat, dst_w: usize, dst_h: usize) -> Mat {
 
 /// Resize an 8-bit image, rounding the way OpenCV's integer path does.
 pub fn resize_area_u8(src: &MatU8, dst_w: usize, dst_h: usize) -> MatU8 {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::resize_area_u8(src, dst_w, dst_h)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        resize_area_u8_native(src, dst_w, dst_h)
+    }
+}
+
+fn resize_area_u8_native(src: &MatU8, dst_w: usize, dst_h: usize) -> MatU8 {
     if src.w == dst_w && src.h == dst_h {
         return src.clone();
     }

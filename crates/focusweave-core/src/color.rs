@@ -11,6 +11,17 @@ const B2Y: i32 = 1868;
 /// `cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)` for `CV_8U`.
 pub fn rgb_to_gray_u8(src: &MatU8) -> MatU8 {
     assert_eq!(src.c, 3, "expected 3-channel RGB input");
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::rgb_to_gray_u8(src)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        rgb_to_gray_u8_native(src)
+    }
+}
+
+fn rgb_to_gray_u8_native(src: &MatU8) -> MatU8 {
     let half = 1 << (YUV_SHIFT - 1);
     let mut dst = MatU8::new(src.h, src.w, 1);
     for (out, px) in dst.data.iter_mut().zip(src.data.chunks_exact(3)) {
@@ -100,6 +111,17 @@ fn descale(x: i32, n: i32) -> i32 {
 /// the a/b channels of the reference implementation are never read.
 pub fn rgb_to_lab_l_u8(src: &MatU8) -> MatU8 {
     assert_eq!(src.c, 3, "expected 3-channel RGB input");
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::rgb_to_lab_l_u8(src)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        rgb_to_lab_l_u8_native(src)
+    }
+}
+
+fn rgb_to_lab_l_u8_native(src: &MatU8) -> MatU8 {
     let t = lab_tabs();
     let l_scale = (116 * 255 + 50) / 100;
     let l_shift = -((16 * 255 * (1 << LAB_SHIFT2)) / 100);

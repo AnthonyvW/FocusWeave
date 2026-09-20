@@ -8,7 +8,17 @@ const HIST_SIZE: usize = 256;
 /// `cv2.createCLAHE(clipLimit, (tiles_x, tiles_y)).apply(src)` for `CV_8UC1`.
 pub fn clahe(src: &MatU8, clip_limit: f64, tiles_x: usize, tiles_y: usize) -> MatU8 {
     assert_eq!(src.c, 1, "CLAHE operates on single-channel images");
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::clahe(src, clip_limit, tiles_x, tiles_y)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        clahe_native(src, clip_limit, tiles_x, tiles_y)
+    }
+}
 
+fn clahe_native(src: &MatU8, clip_limit: f64, tiles_x: usize, tiles_y: usize) -> MatU8 {
     // Pad so the tile grid divides the image exactly; OpenCV reflects the edges.
     let (lut_src, tile_w, tile_h) = if src.w % tiles_x == 0 && src.h % tiles_y == 0 {
         (src.clone(), src.w / tiles_x, src.h / tiles_y)

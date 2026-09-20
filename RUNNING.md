@@ -61,6 +61,26 @@ Two flags to know about while testing:
 - `--no-align` skips registration. Useful for isolating the fusion stage when
   comparing output against the old implementation.
 
+There is a second build that links OpenCV instead of using this project's own
+kernels:
+
+    cargo build --release -p focusweave-cli --features opencv-backend
+
+It is faster (see [Speed](#6-what-to-look-at-first)) and bit-exact with the
+original implementation, but it needs OpenCV 4 headers, libraries and
+libclang to build, and the resulting binary links seven OpenCV shared
+libraries rather than standing alone. On Debian or Ubuntu:
+
+    sudo apt-get install libopencv-dev libclang-dev
+
+Both builds write to `target/release/focusweave`, so copy each one aside if
+you want to compare them:
+
+    cargo build --release -p focusweave-cli
+    cp target/release/focusweave target/focusweave-native
+    cargo build --release -p focusweave-cli --features opencv-backend
+    cp target/release/focusweave target/focusweave-opencv
+
 
 3. Build and use the Python package
 -----------------------------------
@@ -194,6 +214,14 @@ Expected results, which the scripts assert:
 the 2x2 SVD, warp constraints, pyramid round-tripping, canvas layout, slab
 index arithmetic.
 
+To check the OpenCV build instead, point the pipeline stage at that binary:
+
+    FOCUSWEAVE_BIN=$PWD/target/focusweave-opencv python tests/compare_pipeline.py
+
+It comes out bit-exact against the reference on `--no-align`, which is the
+cleanest confirmation that the two backends differ only in their kernels and
+that the fusion arithmetic is shared.
+
 
 6. What to look at first
 ------------------------
@@ -205,38 +233,57 @@ to you:
 have a known-good result for and compare. This is the check that matters; the
 synthetic tests only prove the port is faithful, not that you like the output.
 
-**Speed.** On this machine (4 cores, 10 frames at 2000x1400):
+**Speed.** There are two builds. The default uses the kernels in this
+repository; `--features opencv-backend` routes every primitive to the OpenCV
+C++ library instead. On this machine (4 cores, 10 frames at 2000x1400, best of
+three):
 
-|                       | Rust    | Python + OpenCV |
-| --------------------- | ------- | --------------- |
-| fusion only (`--no-align`) | 1.9 s | 2.2 s         |
-| full run              | 4.4 s   | 3.2 s           |
-| full run, `--workers 0` | 3.9 s |                 |
-| peak memory           | 926 MiB | 1085 MiB        |
+| case                    | own kernels | OpenCV backend | Python + OpenCV |
+| ----------------------- | ----------- | -------------- | --------------- |
+| full run                | 3.68 s      | 2.74 s         | 2.96 s          |
+| fusion only (`--no-align`) | 1.61 s   | 1.32 s         | 1.63 s          |
+| full run, `--workers 0` | 2.99 s      | 2.37 s         | —               |
+| peak memory             | 1096 MiB    | 1168 MiB       | 1106 MiB        |
 
-Fusion is now faster than the OpenCV build. The full run is still about 1.3x
-behind, and all of that sits in alignment — specifically in `warp_affine`,
-which the ECC solver calls four times per iteration. Per core the kernels
-compare like this against OpenCV's SIMD:
+Reproduce with `python tests/bench_all.py`, after building both binaries as
+that script's docstring describes.
 
-| kernel                        | Rust    | OpenCV  |
-| ----------------------------- | ------- | ------- |
-| `sepFilter2D` 5-tap RGB f32   | 44 ms   | 12 ms   |
-| `sepFilter2D` 5-tap gray f32  | 15 ms   | 2 ms    |
-| `GaussianBlur` 15 gray        | 23 ms   | 6 ms    |
-| `warpAffine` cubic RGB u8     | 225 ms  | 52 ms   |
-| `warpAffine` linear gray f32  | 52 ms   | 7 ms    |
-| RGB to Lab (L only)           | 7 ms    | 14 ms   |
+The headline: linking OpenCV buys about 25% over the default build, but only
+about 8% over the Python it replaces. Most of a run is OpenCV either way in
+that configuration, and what Rust adds on top — no GIL, no marshalling — is
+worth less than the kernels themselves. The lever is the kernels, not the
+language.
 
-Two things to read from that. The Lab conversion is faster because the port
-only computes the channel the fusion weights actually use, which is an
-algorithmic win rather than a micro-optimised one. Everything else is the
-SIMD gap: OpenCV dispatches to AVX2 at runtime and accumulates a whole kernel
-in vector registers, while these loops are what the autovectoriser manages on
-its own. Closing it means hand-written SIMD in two functions — `sep_filter`
-and the warp inner loop — with runtime feature detection so the binary stays
-portable. `cargo run --release -p focusweave-core --example bench_primitives`
-reproduces the table, and `RAYON_NUM_THREADS=1` gives the per-core figures.
+Per core, the kernels compare like this (`RAYON_NUM_THREADS=1 cargo run
+--release -p focusweave-core --example bench_primitives`, and again with
+`--features opencv-backend`):
+
+| kernel                        | own kernels | OpenCV |
+| ----------------------------- | ----------- | ------ |
+| `sepFilter2D` 5-tap RGB f32   | 47 ms       | 23 ms  |
+| `sepFilter2D` 5-tap gray f32  | 16 ms       | 3 ms   |
+| `sqrBoxFilter` 3x3 gray       | 20 ms       | 7 ms   |
+| `GaussianBlur` 15 gray        | 22 ms       | 6 ms   |
+| `warpAffine` cubic RGB u8     | 231 ms      | 63 ms  |
+| `warpAffine` linear gray f32  | 56 ms       | 17 ms  |
+| `resize` INTER_AREA           | 42 ms       | 15 ms  |
+| RGB to Lab                    | 7 ms        | 17 ms  |
+
+Lab is the one the default build wins, because it only computes the channel
+the fusion weights actually use rather than all three. Everything else is the
+SIMD gap: OpenCV dispatches hand-written AVX2 at runtime, while these loops
+are what the autovectoriser manages on its own. `warpAffine` is the worst of
+them and the one that still costs the default build a full run, because the
+ECC solver calls it four times per iteration; its per-pixel gather is the part
+that does not vectorise without explicit intrinsics.
+
+Two things that mattered more than expected while getting here. Reshaping the
+separable filter so each tap is a contiguous slice took the 5-tap RGB case
+from 107 ms to 47 ms — loop shape, not instruction set. And switching the
+binary to an allocator that caches large blocks took a further 0.5 s off a
+full run, because the pipeline allocates and frees multi-megabyte scratch
+buffers on every pyramid level and glibc hands each one back to the kernel to
+be re-faulted.
 
 **Alignment on a hard stack.** Macro stacks with lots of out-of-focus area are
 where the ECC differences would show. Run with `--no-align` and without, on

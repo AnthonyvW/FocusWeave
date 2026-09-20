@@ -14,6 +14,17 @@ const MAX_TAPS: usize = 64;
 
 /// Separable correlation, equivalent to `cv2.sepFilter2D` with `CV_32F` output.
 pub fn sep_filter(src: &Mat, kx: &[f32], ky: &[f32], border: Border) -> Mat {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::sep_filter(src, kx, ky, border)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        sep_filter_native(src, kx, ky, border)
+    }
+}
+
+fn sep_filter_native(src: &Mat, kx: &[f32], ky: &[f32], border: Border) -> Mat {
     assert!(
         kx.len() <= MAX_TAPS && ky.len() <= MAX_TAPS,
         "kernel longer than {MAX_TAPS} taps"
@@ -72,21 +83,8 @@ fn filter_rows(src: &Mat, k: &[f32], border: Border) -> Mat {
                 return;
             }
             let out = &mut drow[lo * c..hi * c];
-            let n = out.len();
             let base = &srow[(lo - anchor) * c..];
-            for (j, kv) in k.iter().enumerate() {
-                let taps = &base[j * c..j * c + n];
-                let kv = *kv;
-                if j == 0 {
-                    for (d, s) in out.iter_mut().zip(taps) {
-                        *d = *s * kv;
-                    }
-                } else {
-                    for (d, s) in out.iter_mut().zip(taps) {
-                        *d += *s * kv;
-                    }
-                }
-            }
+            crate::simd::row_taps(out, base, k, c);
         });
     dst
 }
@@ -120,37 +118,7 @@ fn filter_cols(src: &Mat, k: &[f32], border: Border) -> Mat {
                 return;
             }
 
-            match rows.len() {
-                5 => {
-                    let (r0, w0) = rows[0];
-                    let (r1, w1) = rows[1];
-                    let (r2, w2) = rows[2];
-                    let (r3, w3) = rows[3];
-                    let (r4, w4) = rows[4];
-                    for (i, d) in drow.iter_mut().enumerate() {
-                        *d = r0[i] * w0 + r1[i] * w1 + r2[i] * w2 + r3[i] * w3 + r4[i] * w4;
-                    }
-                }
-                3 => {
-                    let (r0, w0) = rows[0];
-                    let (r1, w1) = rows[1];
-                    let (r2, w2) = rows[2];
-                    for (i, d) in drow.iter_mut().enumerate() {
-                        *d = r0[i] * w0 + r1[i] * w1 + r2[i] * w2;
-                    }
-                }
-                _ => {
-                    let (first, weight) = rows[0];
-                    for (d, s) in drow.iter_mut().zip(first) {
-                        *d = *s * weight;
-                    }
-                    for (srow, kv) in &rows[1..] {
-                        for (d, s) in drow.iter_mut().zip(*srow) {
-                            *d += *s * *kv;
-                        }
-                    }
-                }
-            }
+            crate::simd::col_taps(drow, rows);
         });
     dst
 }
@@ -189,6 +157,17 @@ pub fn filter_2d(src: &Mat, kernel: &Mat, border: Border) -> Mat {
 
 /// Normalised box filter, equivalent to `cv2.boxFilter(..., normalize=True)`.
 pub fn box_filter(src: &Mat, kw: usize, kh: usize, border: Border) -> Mat {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::box_filter(src, kw, kh, border)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        box_filter_native(src, kw, kh, border)
+    }
+}
+
+fn box_filter_native(src: &Mat, kw: usize, kh: usize, border: Border) -> Mat {
     let kx = vec![1.0f32 / kw as f32; kw];
     let ky = vec![1.0f32 / kh as f32; kh];
     sep_filter(src, &kx, &ky, border)
@@ -196,6 +175,17 @@ pub fn box_filter(src: &Mat, kw: usize, kh: usize, border: Border) -> Mat {
 
 /// Mean of squares over a window, equivalent to `cv2.sqrBoxFilter(..., normalize=True)`.
 pub fn sqr_box_filter(src: &Mat, kw: usize, kh: usize, border: Border) -> Mat {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::sqr_box_filter(src, kw, kh, border)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        sqr_box_filter_native(src, kw, kh, border)
+    }
+}
+
+fn sqr_box_filter_native(src: &Mat, kw: usize, kh: usize, border: Border) -> Mat {
     let squared = Mat {
         h: src.h,
         w: src.w,
@@ -239,6 +229,17 @@ pub fn gaussian_kernel(n: usize, sigma: f64) -> Vec<f32> {
 
 /// `cv2.GaussianBlur` with a square kernel and OpenCV's default border.
 pub fn gaussian_blur(src: &Mat, ksize: usize, sigma: f64) -> Mat {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::gaussian_blur(src, ksize, sigma)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        gaussian_blur_native(src, ksize, sigma)
+    }
+}
+
+fn gaussian_blur_native(src: &Mat, ksize: usize, sigma: f64) -> Mat {
     if ksize == 1 {
         return src.clone();
     }
@@ -281,6 +282,17 @@ pub fn deriv_kernel(order: usize, ksize: usize) -> Vec<f32> {
 
 /// `cv2.Sobel` with `CV_32F` output and OpenCV's default border.
 pub fn sobel(src: &Mat, dx: usize, dy: usize, ksize: usize) -> Mat {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::sobel(src, dx, dy, ksize)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        sobel_native(src, dx, dy, ksize)
+    }
+}
+
+fn sobel_native(src: &Mat, dx: usize, dy: usize, ksize: usize) -> Mat {
     let kx = deriv_kernel(dx, ksize);
     let ky = deriv_kernel(dy, ksize);
     sep_filter(src, &kx, &ky, Border::Reflect101)
@@ -288,6 +300,17 @@ pub fn sobel(src: &Mat, dx: usize, dy: usize, ksize: usize) -> Mat {
 
 /// `cv2.Laplacian(..., ksize=3)`, which uses OpenCV's hard-coded 3x3 kernel.
 pub fn laplacian3(src: &Mat) -> Mat {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::laplacian3(src)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        laplacian3_native(src)
+    }
+}
+
+fn laplacian3_native(src: &Mat) -> Mat {
     let kernel = Mat::from_vec(3, 3, 1, vec![2.0, 0.0, 2.0, 0.0, -8.0, 0.0, 2.0, 0.0, 2.0]);
     filter_2d(src, &kernel, Border::Reflect101)
 }
@@ -316,6 +339,14 @@ pub fn ellipse_kernel(w: usize, h: usize) -> Vec<Vec<bool>> {
         }
     }
     out
+}
+
+/// Binary dilation with an elliptical structuring element of the given size.
+pub fn dilate_ellipse(src: &crate::mat::MatU8, kw: usize, kh: usize) -> crate::mat::MatU8 {
+    #[cfg(feature = "opencv-backend")]
+    return crate::backend_opencv::dilate_ellipse(src, kw, kh);
+    #[cfg(not(feature = "opencv-backend"))]
+    dilate_u8(src, &ellipse_kernel(kw, kh))
 }
 
 /// Binary dilation with an arbitrary structuring element.

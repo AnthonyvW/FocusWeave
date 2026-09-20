@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import os
+
 import cv2
 import numpy as np
 
@@ -28,7 +30,7 @@ from focusweave.main import save_image  # noqa: E402
 import make_stack  # noqa: E402
 
 WORK = ROOT / "target" / "pipecheck"
-BIN = ROOT / "target" / "release" / "focusweave"
+BIN = Path(os.environ.get("FOCUSWEAVE_BIN", ROOT / "target" / "release" / "focusweave"))
 
 CASES: list[tuple[str, int, dict, list[str], float, float]] = [
     # name, depth, python kwargs, cli flags, max LSB, mean LSB

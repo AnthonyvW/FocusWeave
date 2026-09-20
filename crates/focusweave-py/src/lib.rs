@@ -28,6 +28,13 @@ use pyo3::types::{PyList, PyString, PyTuple};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// The pipeline allocates and frees multi-megabyte scratch buffers on every
+/// pyramid level. glibc services those with `mmap` and returns them to the
+/// kernel immediately, so each one is re-faulted page by page on first write.
+/// An allocator that caches large blocks avoids paying that repeatedly.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// A stacked image and, when only slabs were requested, the slab list.
 type StackOutput<'py> = (Option<Bound<'py, PyAny>>, Option<Bound<'py, PyAny>>);
 /// A canvas size and the warps adjusted to land on it.

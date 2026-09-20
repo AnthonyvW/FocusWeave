@@ -9,5 +9,14 @@ description = "Focus stacking via Laplacian pyramid fusion (core library)"
 
 [dependencies]
 image.workspace = true
+opencv = { version = "0.100", default-features = false, features = ["imgproc", "video"], optional = true }
 rayon.workspace = true
 rustfft.workspace = true
+
+[features]
+default = []
+# Route every image-processing primitive to the OpenCV C++ library instead of
+# the implementations in this crate. Needs OpenCV 4 headers and libraries plus
+# libclang at build time, and links dynamically. Kept so the two can be
+# benchmarked against each other; see docs/PORTING-NOTES.md.
+opencv-backend = ["dep:opencv"]

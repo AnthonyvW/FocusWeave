@@ -8,7 +8,9 @@ subject is sharp.
 Written in Rust with Python bindings. Every image-processing routine the
 pipeline needs is implemented in this repository, so there is no OpenCV to
 install and nothing to link against — the command line binary is a single
-self-contained file of about 3 MB.
+self-contained file of about 3 MB. An `opencv-backend` feature links the C++
+library instead, for anyone who would rather have the last 25% of speed than
+the standalone binary; see [RUNNING.md](RUNNING.md) for the comparison.
 
 Download
 --------
@@ -204,6 +206,11 @@ Command line binary:
 
     cargo build --release -p focusweave-cli
     ./target/release/focusweave --help
+
+Or, linking OpenCV instead of this project's own kernels (needs OpenCV 4
+headers, libraries and libclang):
+
+    cargo build --release -p focusweave-cli --features opencv-backend
 
 Python package, via [maturin](https://maturin.rs):
 

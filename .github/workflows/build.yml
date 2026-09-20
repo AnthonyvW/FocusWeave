@@ -20,6 +20,22 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  opencv-backend:
+    name: OpenCV backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev
+      - run: pip install -r tests/requirements.txt
+      - run: cargo test -p focusweave-core --features opencv-backend
+      - run: cargo build --release -p focusweave-cli --features opencv-backend
+      - name: Compare the OpenCV build against the reference
+        run: FOCUSWEAVE_BIN=$PWD/target/release/focusweave python tests/compare_pipeline.py
+
   compare:
     name: Compare against the reference implementation
     runs-on: ubuntu-latest

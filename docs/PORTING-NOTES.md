@@ -30,17 +30,42 @@ against them: `sepFilter2D`, `filter2D`, `boxFilter`, `sqrBoxFilter`,
 That keeps the build free of system dependencies and the binary at about 3 MB,
 at the cost of scalar inner loops where OpenCV has SIMD.
 
-The alternative considered was the `opencv` crate, which binds the C++ library
-from Rust. It was rejected because it undoes what the rewrite is for: it needs
-OpenCV headers and libs plus libclang at build time on every platform, and it
-links dynamically, so the single-file binary becomes a binary plus a set of
-shared libraries. For the Python side it is worse — a self-contained wheel
-would have to bundle those libraries, so `pip install focusweave` pulls in
-OpenCV again, only now as a private second copy alongside whatever `cv2` the
-caller already has. At that point the Rust layer is replacing orchestration
-code that was never the bottleneck. It remains a reasonable choice for anyone
-who wants bit-identical parity with OpenCV and does not care about
-distribution; see RUNNING.md for where the remaining performance gap sits.
+Both backends
+-------------
+
+The `opencv` crate, which binds the C++ library from Rust, is available behind
+the `opencv-backend` feature, so the two can be measured against each other
+from one tree. Every primitive is a thin dispatcher in front of a `_native`
+implementation; the feature swaps which one is called, and conversion in both
+directions borrows rather than copies, so the numbers reflect the kernels
+rather than marshalling.
+
+On 4 cores, 10 frames at 2000x1400, best of three:
+
+| case                       | own kernels | OpenCV backend | Python + OpenCV |
+| -------------------------- | ----------- | -------------- | --------------- |
+| full run                   | 3.68 s      | 2.74 s         | 2.96 s          |
+| fusion only                | 1.61 s      | 1.32 s         | 1.63 s          |
+| full run, all cores        | 2.99 s      | 2.37 s         | —               |
+| peak memory                | 1096 MiB    | 1168 MiB       | 1106 MiB        |
+| binary                     | 3.5 MB      | 2.7 MB + 16 MB of shared libraries | — |
+
+Linking OpenCV is worth about 25% over the default build and about 8% over the
+Python it replaces. That second number is the interesting one: in that
+configuration most of a run is OpenCV either way, and what Rust adds on top —
+no GIL, no marshalling — is worth less than the kernels themselves.
+
+The cost is the thing the rewrite was for. The OpenCV build needs headers,
+libraries and libclang on every platform and links seven shared libraries
+instead of standing alone. For the Python side it is worse: a self-contained
+wheel would have to bundle those libraries, so `pip install focusweave` pulls
+in OpenCV again, as a private second copy alongside whatever `cv2` the caller
+already has.
+
+The default build stays the pure one. The feature is kept because it is the
+only honest way to answer "how much is this costing us", and because it is a
+reasonable choice for anyone who wants bit-identical parity and does not care
+about distribution.
 
 Where the port is not bit-exact
 -------------------------------
@@ -153,12 +178,21 @@ knowing about before optimising further:
   contiguous runs, so "is any pixel in this window set" is a constant-time
   query rather than a scan of the neighbourhood.
 
-Those two changes took fusion from slower than the OpenCV build to faster than
-it. What remains is `warp_affine`, which the ECC solver calls four times per
-iteration and which is still several times slower per core than OpenCV's. That
-one needs real SIMD: OpenCV dispatches to AVX2 at runtime and keeps a whole
-kernel in vector registers, and neither `-C target-cpu=native` nor reshaping
-the loops gets close on its own.
+- **Large scratch buffers go through an allocator that caches them.** The
+  pipeline allocates and frees multi-megabyte buffers on every pyramid level.
+  glibc services those with `mmap` and returns each one to the kernel
+  immediately, so the next is re-faulted page by page on first write. Swapping
+  the binary and the extension module to mimalloc took half a second off a
+  full run — more than the SIMD work did.
+
+Two findings worth carrying forward. Loop shape mattered far more than
+instruction set: reshaping the separable filter so each tap is a contiguous
+slice took the 5-tap RGB case from 107 ms to 47 ms per core, while enabling
+AVX2 on top of that was worth only a few percent, because the multi-pass form
+it replaced was bandwidth bound rather than compute bound. And the remaining
+gap to OpenCV is concentrated in `warp_affine`, whose per-pixel gather is the
+part that will not vectorise without explicit intrinsics; that is the one
+kernel where closing the distance means writing SIMD by hand.
 
 One pitfall worth recording: replacing a division by a reciprocal multiply in
 the fusion blend produced black patches. The denominator there can be

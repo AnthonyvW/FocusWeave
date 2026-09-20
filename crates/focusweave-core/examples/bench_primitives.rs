@@ -18,6 +18,18 @@ fn bench(label: &str, reps: usize, mut f: impl FnMut()) {
 }
 
 fn main() {
+    // Pin OpenCV to one thread so the per-primitive figures are per core on
+    // both sides; the pure-Rust kernels are measured with RAYON_NUM_THREADS=1.
+    #[cfg(feature = "opencv-backend")]
+    opencv::core::set_num_threads(1).expect("set_num_threads");
+
+    let backend = if cfg!(feature = "opencv-backend") {
+        "opencv"
+    } else {
+        "native"
+    };
+    println!("backend: {backend}");
+
     let (h, w) = (1400usize, 2000usize);
     let rgb8 = MatU8::from_vec(
         h,
@@ -77,5 +89,15 @@ fn main() {
     });
     bench("laplacian_pyramid rgb 6", 3, || {
         std::hint::black_box(pyramid::laplacian_pyramid(&rgb, 6));
+    });
+
+    println!("\ncost of the zero-filled allocations sep_filter makes");
+    bench("Mat::new rgb (x2 per call)", 10, || {
+        std::hint::black_box(Mat::new(h, w, 3));
+        std::hint::black_box(Mat::new(h, w, 3));
+    });
+    bench("Mat::new gray (x2 per call)", 10, || {
+        std::hint::black_box(Mat::new(h, w, 1));
+        std::hint::black_box(Mat::new(h, w, 1));
     });
 }

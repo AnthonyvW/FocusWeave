@@ -97,7 +97,17 @@ pub fn phase_correlate(src1: &Mat, src2: &Mat) -> (f64, f64) {
         src1.h == src2.h && src1.w == src2.w,
         "inputs must match in size"
     );
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::phase_correlate(src1, src2)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        phase_correlate_native(src1, src2)
+    }
+}
 
+fn phase_correlate_native(src1: &Mat, src2: &Mat) -> (f64, f64) {
     let m = optimal_dft_size(src1.h);
     let n = optimal_dft_size(src1.w);
 

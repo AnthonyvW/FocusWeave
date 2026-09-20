@@ -138,6 +138,26 @@ pub fn warp_affine(
     border: Border,
     inverse_map: bool,
 ) -> Mat {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::warp_affine(src, m, dst_w, dst_h, interp, border, inverse_map)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        warp_affine_native(src, m, dst_w, dst_h, interp, border, inverse_map)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn warp_affine_native(
+    src: &Mat,
+    m: &Affine,
+    dst_w: usize,
+    dst_h: usize,
+    interp: Interp,
+    border: Border,
+    inverse_map: bool,
+) -> Mat {
     let inv = if inverse_map { *m } else { m.invert() };
     let c = src.c;
     let mut dst = Mat::new(dst_h, dst_w, c);
@@ -237,6 +257,24 @@ pub fn warp_affine_u8(
     interp: Interp,
     border: Border,
 ) -> MatU8 {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::warp_affine_u8(src, m, dst_w, dst_h, interp, border)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        warp_affine_u8_native(src, m, dst_w, dst_h, interp, border)
+    }
+}
+
+fn warp_affine_u8_native(
+    src: &MatU8,
+    m: &Affine,
+    dst_w: usize,
+    dst_h: usize,
+    interp: Interp,
+    border: Border,
+) -> MatU8 {
     let f = Mat {
         h: src.h,
         w: src.w,
@@ -258,6 +296,24 @@ pub fn warp_affine_u8(
 
 /// Warp a 16-bit image, saturating on write the way OpenCV does.
 pub fn warp_affine_u16(
+    src: &MatU16,
+    m: &Affine,
+    dst_w: usize,
+    dst_h: usize,
+    interp: Interp,
+    border: Border,
+) -> MatU16 {
+    #[cfg(feature = "opencv-backend")]
+    {
+        crate::backend_opencv::warp_affine_u16(src, m, dst_w, dst_h, interp, border)
+    }
+    #[cfg(not(feature = "opencv-backend"))]
+    {
+        warp_affine_u16_native(src, m, dst_w, dst_h, interp, border)
+    }
+}
+
+fn warp_affine_u16_native(
     src: &MatU16,
     m: &Affine,
     dst_w: usize,
