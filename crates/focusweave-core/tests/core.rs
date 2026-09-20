@@ -1,27 +1,10 @@
 //! Unit tests for the pieces that stand alone from image data.
 
 use focusweave_core::affine::{constrain_warp, svd2, Affine, WarpConstraints};
-use focusweave_core::border::{border_index, Border};
 use focusweave_core::fft::optimal_dft_size;
-use focusweave_core::filter::{ellipse_kernel, percentile};
 use focusweave_core::mat::Mat;
 use focusweave_core::pyramid::{compute_levels, laplacian_pyramid, reconstruct};
 use focusweave_core::stack::{compute_canvas, compute_slabs};
-
-#[test]
-fn reflect_modes_follow_opencv() {
-    // BORDER_REFLECT repeats the edge pixel, BORDER_REFLECT_101 does not.
-    let reflect: Vec<usize> = (-3..8)
-        .map(|i| border_index(i, 5, Border::Reflect).unwrap())
-        .collect();
-    assert_eq!(reflect, vec![2, 1, 0, 0, 1, 2, 3, 4, 4, 3, 2]);
-    let reflect101: Vec<usize> = (-3..8)
-        .map(|i| border_index(i, 5, Border::Reflect101).unwrap())
-        .collect();
-    assert_eq!(reflect101, vec![3, 2, 1, 0, 1, 2, 3, 4, 3, 2, 1]);
-    assert_eq!(border_index(-1, 5, Border::Constant), None);
-    assert_eq!(border_index(5, 5, Border::Constant), None);
-}
 
 #[test]
 fn svd_reconstructs_the_matrix() {
@@ -154,25 +137,6 @@ fn slabs_cover_every_index() {
     assert_eq!(compute_slabs(5, 10, 2), vec![(0, 5)]);
     // Zero overlap still steps forward rather than looping.
     assert_eq!(compute_slabs(7, 3, 0), vec![(0, 3), (3, 6), (6, 7)]);
-}
-
-#[test]
-fn percentile_matches_linear_interpolation() {
-    let values: Vec<f32> = (1..=10).map(|v| v as f32).collect();
-    assert!((percentile(&values, 0.0) - 1.0).abs() < 1e-6);
-    assert!((percentile(&values, 100.0) - 10.0).abs() < 1e-6);
-    // numpy.percentile(range(1, 11), 30) == 3.7
-    assert!((percentile(&values, 30.0) - 3.7).abs() < 1e-5);
-}
-
-#[test]
-fn ellipse_structuring_element_matches_opencv() {
-    let se = ellipse_kernel(7, 7);
-    let widths: Vec<usize> = se
-        .iter()
-        .map(|row| row.iter().filter(|v| **v).count())
-        .collect();
-    assert_eq!(widths, vec![1, 5, 7, 7, 7, 5, 1]);
 }
 
 #[test]

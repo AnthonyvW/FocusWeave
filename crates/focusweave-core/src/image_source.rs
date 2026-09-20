@@ -1,7 +1,7 @@
 //! Image loading and the source abstraction shared by every stage.
 
+use crate::cv::{resize_area, resize_area_u8};
 use crate::mat::{Img, Mat, MatU16, MatU8};
-use crate::resize::{resize_area, resize_area_u8};
 use image::DynamicImage;
 use std::path::{Path, PathBuf};
 

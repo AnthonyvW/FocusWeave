@@ -3,8 +3,8 @@
 
 use focusweave_core::affine::Affine;
 use focusweave_core::border::Border;
-use focusweave_core::warp::Interp;
-use focusweave_core::{clahe, color, filter, resize, testio, warp};
+use focusweave_core::cv::{self, Interp};
+use focusweave_core::testio;
 use std::path::PathBuf;
 
 fn main() {
@@ -21,46 +21,45 @@ fn main() {
 
     testio::write_f32(
         dir.join("out_sep_reflect.bin"),
-        &filter::sep_filter(&grayf, &k1d, &k1d, Border::Reflect),
+        &cv::sep_filter(&grayf, &k1d, &k1d, Border::Reflect),
     );
     let rgbf = rgb.to_f32();
     testio::write_f32(
         dir.join("out_sep_rgb.bin"),
-        &filter::sep_filter(&rgbf, &k1d_x2, &k1d_x2, Border::Reflect),
+        &cv::sep_filter(&rgbf, &k1d_x2, &k1d_x2, Border::Reflect),
     );
     testio::write_f32(
         dir.join("out_box3.bin"),
-        &filter::box_filter(&grayf, 3, 3, Border::Reflect),
+        &cv::box_filter(&grayf, 3, 3, Border::Reflect),
     );
     testio::write_f32(
         dir.join("out_box8.bin"),
-        &filter::box_filter(&grayf, 8, 8, Border::Reflect),
+        &cv::box_filter(&grayf, 8, 8, Border::Reflect),
     );
     testio::write_f32(
         dir.join("out_sqrbox3.bin"),
-        &filter::sqr_box_filter(&grayf, 3, 3, Border::Reflect),
+        &cv::sqr_box_filter(&grayf, 3, 3, Border::Reflect),
     );
     testio::write_f32(
         dir.join("out_gauss31.bin"),
-        &filter::gaussian_blur(&grayf, 31, 0.0),
+        &cv::gaussian_blur(&grayf, 31, 0.0),
     );
     testio::write_f32(
         dir.join("out_gauss15.bin"),
-        &filter::gaussian_blur(&grayf, 15, 0.0),
+        &cv::gaussian_blur(&grayf, 15, 0.0),
     );
     testio::write_f32(
         dir.join("out_gauss3.bin"),
-        &filter::gaussian_blur(&grayf, 3, 0.0),
+        &cv::gaussian_blur(&grayf, 3, 0.0),
     );
     testio::write_f32(
         dir.join("out_gauss5.bin"),
-        &filter::gaussian_blur(&grayf, 5, 0.0),
+        &cv::gaussian_blur(&grayf, 5, 0.0),
     );
-    testio::write_f32(dir.join("out_sobel_x.bin"), &filter::sobel(&grayf, 1, 0, 5));
-    testio::write_f32(dir.join("out_sobel_y.bin"), &filter::sobel(&grayf, 0, 1, 5));
-    testio::write_f32(dir.join("out_laplacian.bin"), &filter::laplacian3(&grayf));
+    testio::write_f32(dir.join("out_sobel_x.bin"), &cv::sobel(&grayf, 1, 0, 5));
+    testio::write_f32(dir.join("out_sobel_y.bin"), &cv::sobel(&grayf, 0, 1, 5));
+    testio::write_f32(dir.join("out_laplacian.bin"), &cv::laplacian3(&grayf));
 
-    let se = filter::ellipse_kernel(7, 7);
     let mask = focusweave_core::mat::MatU8::from_vec(
         gray.h,
         gray.w,
@@ -70,33 +69,30 @@ fn main() {
             .map(|v| if *v > 128 { 255u8 } else { 0 })
             .collect(),
     );
-    testio::write_u8(dir.join("out_dilate.bin"), &filter::dilate_u8(&mask, &se));
+    testio::write_u8(dir.join("out_dilate.bin"), &cv::dilate_ellipse(&mask, 7, 7));
 
-    testio::write_u8(
-        dir.join("out_gray_from_rgb.bin"),
-        &color::rgb_to_gray_u8(&rgb),
-    );
-    testio::write_u8(dir.join("out_lab_l.bin"), &color::rgb_to_lab_l_u8(&rgb));
-    testio::write_u8(dir.join("out_clahe.bin"), &clahe::clahe(&gray, 2.0, 8, 8));
+    testio::write_u8(dir.join("out_gray_from_rgb.bin"), &cv::rgb_to_gray_u8(&rgb));
+    testio::write_u8(dir.join("out_lab_l.bin"), &cv::rgb_to_lab_l_u8(&rgb));
+    testio::write_u8(dir.join("out_clahe.bin"), &cv::clahe(&gray, 2.0, 8, 8));
 
     testio::write_u8(
         dir.join("out_resize_small.bin"),
-        &resize::resize_area_u8(&rgb, 41, 29),
+        &cv::resize_area_u8(&rgb, 41, 29),
     );
     testio::write_f32(
         dir.join("out_resize_f32.bin"),
-        &resize::resize_area(&grayf, 53, 37),
+        &cv::resize_area(&grayf, 53, 37),
     );
 
     let m = Affine([1.004, -0.013, 7.35, 0.011, 0.997, -4.2]);
     testio::write_u8(
         dir.join("out_warp_cubic.bin"),
-        &warp::warp_affine_u8(&rgb, &m, rgb.w, rgb.h, Interp::Cubic, Border::Reflect),
+        &cv::warp_affine_u8(&rgb, &m, rgb.w, rgb.h, Interp::Cubic, Border::Reflect),
     );
     let t = Affine([1.0, 0.0, 6.0, 0.0, 1.0, -3.0]);
     testio::write_u8(
         dir.join("out_warp_translate.bin"),
-        &warp::warp_affine_u8(&rgb, &t, rgb.w, rgb.h, Interp::Linear, Border::Constant),
+        &cv::warp_affine_u8(&rgb, &t, rgb.w, rgb.h, Interp::Linear, Border::Constant),
     );
 
     println!("wrote primitive dumps to {}", dir.display());

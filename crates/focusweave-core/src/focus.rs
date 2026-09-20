@@ -1,12 +1,36 @@
 //! Sharpness scoring, culling, and the focus masks that steer registration.
 
-use crate::clahe::clahe;
-use crate::color::{cv_round, rgb_to_gray_u8};
-use crate::filter::{dilate_ellipse, gaussian_blur, laplacian3, percentile, sobel};
+use crate::cv::{
+    clahe, cv_round, dilate_ellipse, gaussian_blur, laplacian3, resize_area, resize_area_u8,
+    rgb_to_gray_u8, sobel,
+};
 use crate::hooks::{Error, Hooks, Stage};
 use crate::image_source::{load_u8, Source};
 use crate::mat::{Mat, MatU8};
-use crate::resize::{resize_area, resize_area_u8};
+
+/// `numpy.percentile` with the default linear interpolation method.
+///
+/// Uses selection rather than a full sort; only the two order statistics
+/// bracketing the requested rank are needed.
+fn percentile(values: &[f32], q: f64) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut buf: Vec<f32> = values.to_vec();
+    let n = buf.len();
+    let pos = (q / 100.0) * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+
+    let (_, lo_val, rest) = buf.select_nth_unstable_by(lo, cmp);
+    let lo_val = *lo_val;
+    if lo == hi {
+        return lo_val;
+    }
+    let hi_val = *rest.iter().min_by(|a, b| cmp(a, b)).unwrap_or(&lo_val);
+    lo_val + (hi_val - lo_val) * (pos - lo as f64) as f32
+}
 
 const CLAHE_CLIP: f64 = 2.0;
 const CLAHE_TILES: usize = 8;

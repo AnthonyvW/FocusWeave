@@ -2,7 +2,7 @@
 //! weight each band.
 
 use crate::border::Border;
-use crate::filter::{box_filter, sep_filter, sqr_box_filter};
+use crate::cv::{box_filter, sep_filter, sqr_box_filter};
 use crate::mat::Mat;
 
 /// The 5-tap binomial kernel the pyramid is built from.

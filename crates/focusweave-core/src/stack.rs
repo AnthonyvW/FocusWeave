@@ -2,14 +2,13 @@
 
 use crate::affine::Affine;
 use crate::border::Border;
-use crate::color::rgb_to_lab_l_f32;
+use crate::cv::{rgb_to_lab_l_f32, warp_affine_u16, warp_affine_u8, Interp};
 use crate::hooks::{Error, Hooks, Stage};
 use crate::image_source::{load_native_f32, load_u8, source_depth, source_size, ImageBuf, Source};
 use crate::mat::{Mat, MatU16, MatU8};
 use crate::pyramid::{
     laplacian_pyramid, reconstruct, region_deviation, region_energy, region_entropy,
 };
-use crate::warp::{warp_affine_u16, warp_affine_u8, Interp};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 

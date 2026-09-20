@@ -1,8 +1,9 @@
-//! Times the primitives that dominate a run, for comparison against OpenCV.
+//! Times the primitives that dominate a run.
 
+use focusweave_core::affine::Affine;
 use focusweave_core::border::Border;
-use focusweave_core::warp::Interp;
-use focusweave_core::{affine::Affine, color, filter, mat::*, pyramid, resize, warp};
+use focusweave_core::cv::{self, Interp};
+use focusweave_core::{mat::*, pyramid};
 use std::time::Instant;
 
 fn bench(label: &str, reps: usize, mut f: impl FnMut()) {
@@ -18,18 +19,6 @@ fn bench(label: &str, reps: usize, mut f: impl FnMut()) {
 }
 
 fn main() {
-    // Pin OpenCV to one thread so the per-primitive figures are per core on
-    // both sides; the pure-Rust kernels are measured with RAYON_NUM_THREADS=1.
-    #[cfg(feature = "opencv-backend")]
-    opencv::core::set_num_threads(1).expect("set_num_threads");
-
-    let backend = if cfg!(feature = "opencv-backend") {
-        "opencv"
-    } else {
-        "native"
-    };
-    println!("backend: {backend}");
-
     let (h, w) = (1400usize, 2000usize);
     let rgb8 = MatU8::from_vec(
         h,
@@ -38,7 +27,7 @@ fn main() {
         (0..h * w * 3).map(|i| ((i * 37) % 251) as u8).collect(),
     );
     let rgb = rgb8.to_f32();
-    let gray8 = color::rgb_to_gray_u8(&rgb8);
+    let gray8 = cv::rgb_to_gray_u8(&rgb8);
     let gray = gray8.to_f32();
 
     let k: Vec<f32> = [1.0f32, 4.0, 6.0, 4.0, 1.0]
@@ -49,19 +38,19 @@ fn main() {
 
     println!("single primitives at {w}x{h}\n");
     bench("sep_filter 5-tap rgb f32", 5, || {
-        std::hint::black_box(filter::sep_filter(&rgb, &k, &k, Border::Reflect));
+        std::hint::black_box(cv::sep_filter(&rgb, &k, &k, Border::Reflect));
     });
     bench("sep_filter 5-tap gray f32", 5, || {
-        std::hint::black_box(filter::sep_filter(&gray, &k, &k, Border::Reflect));
+        std::hint::black_box(cv::sep_filter(&gray, &k, &k, Border::Reflect));
     });
     bench("sqr_box_filter 3x3 gray", 5, || {
-        std::hint::black_box(filter::sqr_box_filter(&gray, 3, 3, Border::Reflect));
+        std::hint::black_box(cv::sqr_box_filter(&gray, 3, 3, Border::Reflect));
     });
     bench("gaussian_blur 15 gray", 5, || {
-        std::hint::black_box(filter::gaussian_blur(&gray, 15, 0.0));
+        std::hint::black_box(cv::gaussian_blur(&gray, 15, 0.0));
     });
     bench("warp_affine cubic rgb u8", 5, || {
-        std::hint::black_box(warp::warp_affine_u8(
+        std::hint::black_box(cv::warp_affine_u8(
             &rgb8,
             &m,
             w,
@@ -71,7 +60,7 @@ fn main() {
         ));
     });
     bench("warp_affine linear gray f32", 5, || {
-        std::hint::black_box(warp::warp_affine(
+        std::hint::black_box(cv::warp_affine(
             &gray,
             &m,
             w,
@@ -82,10 +71,10 @@ fn main() {
         ));
     });
     bench("rgb_to_lab_l u8", 5, || {
-        std::hint::black_box(color::rgb_to_lab_l_u8(&rgb8));
+        std::hint::black_box(cv::rgb_to_lab_l_u8(&rgb8));
     });
     bench("resize_area rgb u8 -> 1024", 5, || {
-        std::hint::black_box(resize::resize_area_u8(&rgb8, 1024, 716));
+        std::hint::black_box(cv::resize_area_u8(&rgb8, 1024, 716));
     });
     bench("laplacian_pyramid rgb 6", 3, || {
         std::hint::black_box(pyramid::laplacian_pyramid(&rgb, 6));

@@ -3,8 +3,10 @@
 use crate::affine::{constrain_warp, Affine, WarpConstraints};
 use crate::align::run_ecc;
 use crate::border::Border;
-use crate::color::{cv_round, rgb_to_gray_u8, rgb_to_lab_l_f32};
 use crate::config::RunResult;
+use crate::cv::{
+    cv_round, rgb_to_gray_u8, rgb_to_lab_l_f32, warp_affine_u16, warp_affine_u8, Interp,
+};
 use crate::focus::{prepare_for_ecc, score_map_to_scalar, tenengrad_score_map, Prepared};
 use crate::hooks::{Error, Hooks, Stage};
 use crate::image_source::{load_u8, ImageBuf, Source};
@@ -13,7 +15,6 @@ use crate::pyramid::{
     compute_levels, laplacian_pyramid, reconstruct, region_deviation, region_energy, region_entropy,
 };
 use crate::stack::{compute_canvas, slab_images, stack_images, SlabOutcome, StackOptions};
-use crate::warp::{warp_affine_u16, warp_affine_u8, Interp};
 
 #[derive(Clone, Debug)]
 pub struct StreamingConfig {

@@ -5,12 +5,10 @@ Focus stacking via Laplacian pyramid fusion. Takes a set of images captured at
 different focus distances and combines them into a single image where the entire
 subject is sharp.
 
-Written in Rust with Python bindings. Every image-processing routine the
-pipeline needs is implemented in this repository, so there is no OpenCV to
-install and nothing to link against — the command line binary is a single
-self-contained file of about 3 MB. An `opencv-backend` feature links the C++
-library instead, for anyone who would rather have the last 25% of speed than
-the standalone binary; see [RUNNING.md](RUNNING.md) for the comparison.
+Written in Rust, with Python bindings and OpenCV underneath for the
+image-processing kernels. On a four-core machine it stacks 25 frames at
+2592x1944 in 6.3 s against the original Python implementation's 9.6 s, and the
+margin widens with core count.
 
 Download
 --------
@@ -70,9 +68,10 @@ Command-line options
                             the sharpest image more aggressively at each pixel, approaching
                             a hard winner-take-all selection. Useful range is roughly
                             1.0 (soft blend) to 8.0 (near-hard selection).
-    --workers N             Number of parallel stacking workers (default: 3). Higher values
-                            are faster but increase peak RAM by ~100 MiB per additional
-                            worker. Set to 0 to use all CPU cores.
+    --workers N             Number of frames fused concurrently. The default is automatic:
+                            one per core, capped so the workers' buffers fit in free
+                            memory. Each worker costs roughly 110 MB per megapixel of
+                            output. Pass a number to override it.
 
     Culling options
     --cull [THRESHOLD]      Remove wholly out-of-focus images before stacking. Each frame
@@ -101,13 +100,11 @@ Slabbing splits a large image set into overlapping sub-stacks, stacks each one i
 
 Memory usage
 ------------
-With default settings (3 workers), expect around 200 MiB per megapixel of input
-image resolution. To halve memory usage at the cost of roughly double the
-processing time, set workers to 1:
+Peak memory is roughly 110 MB per megapixel of output per worker. The worker
+count defaults to one per core, capped so those buffers fit in free memory. To
+cut memory to the minimum at the cost of throughput:
 
     focusweave path/to/images/ --workers 1
-
-Set `--workers 0` to use every core.
 
 Python API
 ----------
@@ -199,27 +196,25 @@ See `python/focusweave/api_example.py` for a more complete example, or run it:
 
 Building from source
 --------------------
-A Rust toolchain (1.82 or newer) is required; Python 3.10 or newer if you want
-the bindings.
+A Rust toolchain (1.82 or newer) is required, plus OpenCV 4 development files
+and libclang, which the `opencv` crate compiles and links against. Python 3.10
+or newer if you want the bindings.
 
-There are two builds. The default needs nothing but Rust and produces a
-self-contained binary. The `opencv-backend` one calls the OpenCV C++ library
-for its image processing and is about 25% faster, at the cost of needing
-OpenCV 4 development files and libclang to build and linking OpenCV's shared
-libraries at run time. **If you are benchmarking, build that one** —
-[RUNNING.md](RUNNING.md) has the per-platform prerequisites and the numbers.
+    sudo apt-get install libopencv-dev libclang-dev   # Debian, Ubuntu
+    brew install opencv llvm                          # macOS
+    choco install llvm opencv                         # Windows, plus the
+                                                      # environment variables in
+                                                      # RUNNING.md
 
 Command line binary:
 
-    cargo build --release -p focusweave-cli                            # default
-    cargo build --release -p focusweave-cli --features opencv-backend  # faster
+    cargo build --release -p focusweave-cli
     ./target/release/focusweave --help
 
 Python package, via [maturin](https://maturin.rs):
 
     pip install maturin
-    maturin develop --release                            # default
-    maturin develop --release --features opencv-backend  # faster
+    maturin develop --release
 
 Once installed, the `focusweave` command is available on your PATH and is the
 same CLI as the native binary.

@@ -7,9 +7,8 @@
 
 use crate::affine::Affine;
 use crate::border::Border;
-use crate::filter::{filter_2d, gaussian_blur};
+use crate::cv::{filter_2d, gaussian_blur, warp_affine, Interp};
 use crate::mat::{Mat, MatU8};
-use crate::warp::{warp_affine, Interp};
 use rayon::prelude::*;
 
 const PARAMS: usize = 6;

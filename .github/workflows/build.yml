@@ -8,6 +8,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # Chocolatey's OpenCV package; the version is pinned so the link libraries
+  # below keep matching it.
+  OPENCV_VERSION: "4.10.0"
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -16,25 +21,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-
-  opencv-backend:
-    name: OpenCV backend
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev
-      - run: pip install -r tests/requirements.txt
-      - run: cargo test -p focusweave-core --features opencv-backend
-      - run: cargo build --release -p focusweave-cli --features opencv-backend
-      - name: Compare the OpenCV build against the reference
-        run: FOCUSWEAVE_BIN=$PWD/target/release/focusweave python tests/compare_pipeline.py
 
   compare:
     name: Compare against the reference implementation
@@ -45,6 +35,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev patchelf
       - run: pip install -r tests/requirements.txt maturin
       - run: cargo build --release -p focusweave-cli
       - run: maturin build --release --out dist
@@ -75,6 +66,25 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install OpenCV (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev
+      - name: Install OpenCV (macOS)
+        if: runner.os == 'macOS'
+        run: brew install opencv llvm
+      - name: Install OpenCV (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install --no-progress -y llvm opencv --version=$env:OPENCV_VERSION
+          $v = $env:OPENCV_VERSION -replace '\.', '' -replace '0$', ''
+          "OPENCV_INCLUDE_PATHS=C:\tools\opencv\build\include"      >> $env:GITHUB_ENV
+          "OPENCV_LINK_PATHS=C:\tools\opencv\build\x64\vc16\lib"    >> $env:GITHUB_ENV
+          "OPENCV_LINK_LIBS=opencv_world$v"                         >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin"                 >> $env:GITHUB_ENV
+          # The build script loads libclang.dll, so LLVM must be on PATH too.
+          "C:\Program Files\LLVM\bin"                               >> $env:GITHUB_PATH
+          "C:\tools\opencv\build\x64\vc16\bin"                      >> $env:GITHUB_PATH
       - run: cargo build --release -p focusweave-cli
       - name: Name the artifact for release
         shell: bash
@@ -105,11 +115,33 @@ jobs:
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install OpenCV (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev patchelf
+      - name: Install OpenCV (macOS)
+        if: runner.os == 'macOS'
+        run: brew install opencv llvm
+      - name: Install OpenCV (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install --no-progress -y llvm opencv --version=$env:OPENCV_VERSION
+          $v = $env:OPENCV_VERSION -replace '\.', '' -replace '0$', ''
+          "OPENCV_INCLUDE_PATHS=C:\tools\opencv\build\include"      >> $env:GITHUB_ENV
+          "OPENCV_LINK_PATHS=C:\tools\opencv\build\x64\vc16\lib"    >> $env:GITHUB_ENV
+          "OPENCV_LINK_LIBS=opencv_world$v"                         >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin"                 >> $env:GITHUB_ENV
+          "C:\Program Files\LLVM\bin"                               >> $env:GITHUB_PATH
+          "C:\tools\opencv\build\x64\vc16\bin"                      >> $env:GITHUB_PATH
+      # `container: off` builds against the runner's own OpenCV rather than in a
+      # manylinux image, which has none. The Linux wheel is therefore tagged
+      # linux_x86_64, not manylinux; publishing a portable one means building a
+      # trimmed OpenCV inside the manylinux container first.
       - uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release --out dist
-          manylinux: auto
+          container: off
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.os }}

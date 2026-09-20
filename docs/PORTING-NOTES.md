@@ -8,7 +8,7 @@ original is preserved under `tests/reference/` and the comparison harness in
 Layout
 ------
 
-    crates/focusweave-core/   the algorithm and every primitive it needs
+    crates/focusweave-core/   the algorithm, and cv.rs, its OpenCV bindings
     crates/focusweave-cli/    a thin wrapper around core::cli
     crates/focusweave-py/     PyO3 bindings, built as focusweave._core
     python/focusweave/        the Python package: dataclasses and signatures
@@ -18,74 +18,49 @@ Layout
 The CLI argument parser lives in the core crate so the native binary and the
 `focusweave` console script cannot drift apart.
 
-No OpenCV
----------
+Which parts are OpenCV's
+------------------------
 
-The port implements the OpenCV routines the pipeline used rather than linking
-against them: `sepFilter2D`, `filter2D`, `boxFilter`, `sqrBoxFilter`,
-`GaussianBlur`, `Sobel`, `Laplacian`, `dilate`, `resize` with `INTER_AREA`,
-`warpAffine`, `cvtColor` for gray and Lab, `createCLAHE`, `phaseCorrelate` and
-`findTransformECC`. Image decoding and encoding go through the `image` crate.
+The pipeline's image processing calls OpenCV through the `opencv` crate:
+`sepFilter2D`, `filter2D`, `boxFilter`, `sqrBoxFilter`, `GaussianBlur`,
+`Sobel`, `Laplacian`, `dilate`, `resize` with `INTER_AREA`, `warpAffine`,
+`cvtColor` for gray and Lab, and `createCLAHE`. Conversion in both directions
+borrows rather than copies — a `Mat` here is a plain row-major buffer, and
+`cv::Mat::new_rows_cols_with_data` wraps it in place — so nothing is marshalled
+across the boundary.
 
-That keeps the build free of system dependencies and the binary at about 3 MB,
-at the cost of scalar inner loops where OpenCV has SIMD.
+Only `core` and `imgproc` are linked. Registration stays on this crate's own
+ECC solver and phase correlation, because they measure the same speed as
+OpenCV's: on 25 frames the alignment stage takes about 2 s either way. Taking
+OpenCV's would mean linking `opencv_video` for one function,
+`findTransformECC`, and that drags in dnn, calib3d, features2d and flann —
+6.7 MB of the 16 MB it would otherwise cost, for nothing. Trimmed to core and
+imgproc the dependency is two libraries and 8.2 MB.
 
-Both backends
--------------
+Image decoding and encoding go through the `image` crate rather than
+`imgcodecs`, which would pull in libjpeg, libpng, libtiff and libwebp on top.
 
-The `opencv` crate, which binds the C++ library from Rust, is available behind
-the `opencv-backend` feature, so the two can be measured against each other
-from one tree. Every primitive is a thin dispatcher in front of a `_native`
-implementation; the feature swaps which one is called, and conversion in both
-directions borrows rather than copies, so the numbers reflect the kernels
-rather than marshalling.
-
-Only `imgproc` is routed to OpenCV. Registration stays on this crate's ECC
-solver and phase correlation, because they measure the same speed as OpenCV's:
-on 25 frames the alignment stage takes 2.4 s either way. Taking OpenCV's would
-mean linking `opencv_video` for one function, `findTransformECC`, and that
-drags in dnn, calib3d, features2d and flann — 6.7 MB of the 16 MB it would
-otherwise cost, for nothing. Trimmed to core and imgproc the dependency is two
-libraries and 8.2 MB.
-
-On 4 cores, 25 frames at 2592x1944, best of three:
-
-| case          | own kernels | OpenCV backend | Python + OpenCV |
-| ------------- | ----------- | -------------- | --------------- |
-| full run      | 10.0 s      | 7.3 s          | 10.0 s          |
-| binary        | 3.5 MB      | 2.7 MB + 8.2 MB of shared libraries | — |
-
-The whole difference is in stacking. That is worth stating plainly: the
-rewrite bought portability and a single-file binary, and roughly parity with
-the Python it replaced; the further 1.4x costs a C++ dependency. Language was
-never the lever — kernels were.
-
-The cost is the thing the rewrite was for. The OpenCV build needs headers,
-libraries and libclang on every platform and links seven shared libraries
-instead of standing alone. For the Python side it is worse: a self-contained
-wheel would have to bundle those libraries, so `pip install focusweave` pulls
-in OpenCV again, as a private second copy alongside whatever `cv2` the caller
-already has.
-
-The default build stays the pure one. The feature is kept because it is the
-only honest way to answer "how much is this costing us", and because it is a
-reasonable choice for anyone who wants bit-identical parity and does not care
-about distribution.
+This was not the first design. The port originally implemented every one of
+those routines in Rust and linked nothing, which made for a self-contained
+3.5 MB binary — and ran the benchmark set in 10.0 s, exactly level with the
+Python it replaced and 1.6x slower than linking OpenCV. Those kernels were
+deleted; the history has them. What they cost in maintenance was a second
+implementation of every primitive, with its own border handling, its own
+rounding, and its own SIMD, to stay within a few LSB of the library the
+reference was calling anyway. What they bought was portability. The exchange
+rate was not good, and the performance section below records why: the gap was
+not the instruction set.
 
 Where the port is not bit-exact
 -------------------------------
 
-**Rounding ties.** `RGB2GRAY`, `RGB2Lab` and CLAHE disagree with OpenCV 5 by
-one unit in the last place on roughly one pixel in a thousand, always where
-the exact value sits on a `.5` boundary. OpenCV 5 resolves those in its SIMD
-path differently from its own integer formula, so this is not reproducible
-from the documented behaviour and does not affect anything downstream — these
-feed sharpness scoring and alignment masks, not output pixels.
-
-**Warping precision.** `warp_affine` evaluates source coordinates in full
-floating point. Historically OpenCV quantised them to 1/32 of a pixel via
-fixed-point coordinate maps; OpenCV 5 no longer does, and the two agree to
-about 0.001 of a grey level on float images.
+Filtering, resampling, warping and colour conversion are the same OpenCV calls
+the reference makes, so against the same OpenCV they are exact, and stacked
+output with `--no-align` lands within 1 of 255. Comparing across OpenCV major
+versions — a pip `opencv-python` on one side, the system library on the other —
+adds a little drift of its own: cubic `warpAffine` by up to 2 of 255 and wide
+`GaussianBlur` by about 5e-5, from changes to OpenCV's fixed-point
+interpolation tables. Neither is the port's doing. One thing is.
 
 **Masked ECC.** Without a mask, the port's ECC solver agrees with
 `cv2.findTransformECC` to about 1e-7. With one — which is what the pipeline
@@ -154,14 +129,15 @@ Deliberate additions
 --------------------
 
 `focusweave.load_image` and `focusweave.save_image` are new. The original
-package documented `cv2` for file I/O in its examples; with OpenCV gone, the
-package supplies its own.
+package documented `cv2` for file I/O in its examples. The Rust package links
+OpenCV but does not re-export it, and numpy remains its only Python
+dependency, so it supplies its own.
 
 Performance work
 ----------------
 
-Three changes account for most of the speed of the Rust build, and are worth
-knowing about before optimising further:
+What the port is faster at is everything around the kernels, since the kernels
+are the same ones the reference called. Four changes account for most of it:
 
 - **The ECC normal equations are accumulated in one pass.** The reference
   materialises the Jacobian as six full-resolution planes and then takes 39
@@ -169,54 +145,53 @@ knowing about before optimising further:
   coordinate weight, every entry of the Hessian and of the projections can be
   summed in a single traversal. This cut `run_ecc` from 3.1 s to 2.1 s on the
   benchmark set before any parallelism.
-- **Separable filtering splits margins from the interior, and accumulates one
-  tap at a time over contiguous slices.** Columns whose taps all land inside
-  the image skip border-index lookups entirely. Within the interior, tap `j`
-  of output element `i` lives at `base[i + j * c]` for any channel count, so
-  each tap is a contiguous slice of the source and the accumulation becomes a
-  multiply-add the autovectoriser can widen. Writing it as a per-element
-  gather instead — the obvious formulation — leaves it scalar. The column pass
-  gathers its contributing rows first and sums them in one traversal rather
-  than adding each tap into the destination separately, which would read and
-  rewrite the whole row once per tap.
-- **Dilation uses per-row prefix sums.** The structuring element's rows are
-  contiguous runs, so "is any pixel in this window set" is a constant-time
-  query rather than a scan of the neighbourhood.
-
-- **The separable filter's two passes are fused.** Writing the horizontally
-  filtered image out in full and reading it back adds two trips through main
-  memory per filter, and the kernels are memory bound long before they are
-  compute bound — coarse parallelism over frames stopped scaling past two
-  workers because of it. Each band of output rows now keeps a ring of just
-  `ky.len()` filtered rows, small enough to stay in cache, and the
-  intermediate never exists in full. This also made the rayon work items
-  whole bands rather than single rows, which matters much more the more cores
-  the machine has.
-- **The fusion workers are rayon tasks, not OS threads.** The filters they
-  call parallelise internally, and rayon composes nested parallelism from
-  inside its own pool; injecting it from foreign threads instead turns every
-  inner `parallel_for` into a cross-thread handshake. `in_place_scope` is what
-  allows this while the non-`Send` progress hooks stay on the calling thread.
+- **Frames are fused concurrently, and the worker count is sized to the
+  machine.** Much of fusing a frame is per-pixel work that no individual
+  kernel parallelises, so coarse parallelism over frames is what scales. The
+  fixed default of three inherited from the Python implementation left a
+  twenty-thread machine mostly idle; the default is now one worker per core,
+  capped by measured free memory, since each costs about 110 MB per megapixel
+  of output.
+- **The fusion workers are rayon tasks, not OS threads.** OpenCV parallelises
+  internally too, and injecting work into a thread pool from foreign threads
+  turns every inner parallel region into a cross-thread handshake.
+  `in_place_scope` is what allows running the workers on rayon's own pool
+  while the non-`Send` progress hooks stay on the calling thread.
 - **Large scratch buffers go through an allocator that caches them.** The
   pipeline allocates and frees multi-megabyte buffers on every pyramid level.
   glibc services those with `mmap` and returns each one to the kernel
   immediately, so the next is re-faulted page by page on first write. Swapping
   the binary and the extension module to mimalloc took half a second off a
-  full run — more than the SIMD work did.
+  full run.
 
-Two findings worth carrying forward. Memory traffic and scheduling shape
-mattered far more than instruction set — and both only showed up at scale. A
-ten-frame benchmark on four cores hid them entirely; twenty-five frames on
-twenty threads made stacking *slower* than the same work on four. Loop shape
-came next: reshaping the separable filter so each tap is a contiguous
-slice took the 5-tap RGB case from 107 ms to 47 ms per core, while enabling
-AVX2 on top of that was worth only a few percent, because the multi-pass form
-it replaced was bandwidth bound rather than compute bound. And the remaining
-gap to OpenCV is concentrated in `warp_affine`, whose per-pixel gather is the
-part that will not vectorise without explicit intrinsics; that is the one
-kernel where closing the distance means writing SIMD by hand.
+What the deleted Rust kernels taught
+------------------------------------
 
-One pitfall worth recording: replacing a division by a reciprocal multiply in
-the fusion blend produced black patches. The denominator there can be
-denormal, and its reciprocal overflows to infinity where the division stays
-finite; `0 * inf` is NaN, and NaN casts to zero. The division is deliberate.
+Kept because the conclusions outlived the code, and because they are the
+reason the OpenCV dependency is worth its size.
+
+Memory traffic and scheduling shape mattered far more than instruction set,
+and both only showed up at scale. A ten-frame benchmark on four cores hid them
+entirely; twenty-five frames on twenty threads made stacking *slower* than the
+same work on four, because the separable filter materialised its horizontally
+filtered intermediate in full and the kernels were memory bound long before
+they were compute bound. Fusing the two passes behind a small ring of rows
+fixed it.
+
+Loop shape came next. Reshaping the separable filter so that tap `j` of output
+element `i` reads `base[i + j * c]` — a contiguous slice per tap, rather than a
+per-element gather — took the 5-tap RGB case from 107 ms to 47 ms per core.
+Enabling AVX2 on top of that was worth a few percent, because the multi-pass
+form it replaced was bandwidth bound rather than compute bound.
+
+And the gap that would not close was `warpAffine`, whose per-pixel gather does
+not vectorise without hand-written intrinsics: 231 ms against OpenCV's 63 ms
+on cubic RGB. That was the kernel that decided it. Matching OpenCV meant
+writing its SIMD again, one primitive at a time, to arrive at the same
+arithmetic.
+
+One pitfall worth recording from that work, since the fusion blend it concerns
+is still here: replacing a division by a reciprocal multiply produced black
+patches. The denominator there can be denormal, and its reciprocal overflows
+to infinity where the division stays finite; `0 * inf` is NaN, and NaN casts to
+zero. The division is deliberate.

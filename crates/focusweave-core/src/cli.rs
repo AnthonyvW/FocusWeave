@@ -63,8 +63,8 @@ Slabbing options
   --slab-format EXT       File format for slab images (default: tiff).
 
 Other
-  --timings               Print how long each stage took, and what this build is,
-                          after the run. Useful when reporting a slow run.
+  --timings               Print how long each stage took after the run. Useful
+                          when reporting a slow run.
   --version               Show the version number and exit.
   --formats               List the supported image extensions and exit.
   --help                  Show this message and exit.
@@ -233,7 +233,6 @@ impl StageTimer {
 
     fn report(&self, total: Duration) {
         println!("\nTimings");
-        println!("  build          {} kernels", crate::BACKEND);
         println!("  threads        {} available", available_threads());
         for (stage, elapsed) in &self.totals {
             let share = elapsed.as_secs_f64() / total.as_secs_f64() * 100.0;

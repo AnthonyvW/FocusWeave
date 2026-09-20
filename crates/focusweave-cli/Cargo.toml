@@ -14,8 +14,3 @@ path = "src/main.rs"
 [dependencies]
 focusweave-core.workspace = true
 mimalloc = { version = "0.1.52", default-features = false }
-
-[features]
-default = []
-# Build against the OpenCV C++ library instead of this project's own kernels.
-opencv-backend = ["focusweave-core/opencv-backend"]

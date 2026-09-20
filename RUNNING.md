@@ -1,21 +1,16 @@
 Running the Rust FocusWeave
 ===========================
 
-FocusWeave is now a Rust workspace with Python bindings.
-
-**There are two builds, and the difference matters.** The default one uses the
-image-processing kernels implemented in this repository and needs nothing but
-a Rust toolchain. The `opencv-backend` one calls the OpenCV C++ library
-instead and is the faster of the two — about 25% on a full run. If you are
-timing FocusWeave against the old Python implementation, build that one, or
-you are comparing this project's hand-written kernels against OpenCV's
-hand-written SIMD and the Python will look good. [Pick a build](#2-pick-a-build)
-has both commands and what each needs installed.
+FocusWeave is a Rust workspace with Python bindings. The image-processing
+kernels come from OpenCV's C++ library, so **OpenCV 4 and libclang have to be
+installed before anything will build.** [Install the prerequisites](#1-install-the-prerequisites)
+has the commands for each platform; everything after that is a normal Rust
+build.
 
 Contents:
 
-1. [Get a toolchain](#1-get-a-toolchain)
-2. [Pick a build](#2-pick-a-build)
+1. [Install the prerequisites](#1-install-the-prerequisites)
+2. [Build](#2-build)
 3. [Run the CLI](#3-run-the-cli)
 4. [Build and use the Python package](#4-build-and-use-the-python-package)
 5. [Make yourself a test stack](#5-make-yourself-a-test-stack)
@@ -24,8 +19,8 @@ Contents:
 8. [Troubleshooting](#8-troubleshooting)
 
 
-1. Get a toolchain
-------------------
+1. Install the prerequisites
+----------------------------
 
 Rust 1.82 or newer:
 
@@ -33,47 +28,9 @@ Rust 1.82 or newer:
 
 On Windows, install [rustup](https://rustup.rs) and the MSVC build tools.
 
-Check it:
-
-    cargo --version
-
-That is all the default build needs. The OpenCV build needs a little more,
-below.
-
-
-2. Pick a build
----------------
-
-Both builds accept the same flags and produce the same picture. They differ
-only in whose image-processing kernels run underneath.
-
-| | default | `--features opencv-backend` |
-| --- | --- | --- |
-| command | `cargo build --release -p focusweave-cli` | `cargo build --release -p focusweave-cli --features opencv-backend` |
-| needs | a Rust toolchain | OpenCV 4 `core` and `imgproc`, plus libclang |
-| speed | baseline | ~1.4x faster overall, ~3x on some kernels |
-| result | self-contained 3.5 MB binary | 2.7 MB binary plus two OpenCV libraries, ~8 MB |
-| output | within a few LSB of the original | identical to the original without alignment, within a few LSB with it |
-
-**Build the OpenCV one if speed is what you care about.** The numbers are in
-[What to look at first](#7-what-to-look-at-first); the short version is that
-the default build's kernels are scalar Rust and OpenCV's are hand-written
-AVX2, and no amount of threading closes that on its own.
-
-Both write to the same path, `target/release/focusweave`, so copy each aside
-if you want to compare them:
-
-    cargo build --release -p focusweave-cli
-    cp target/release/focusweave target/focusweave-native
-
-    cargo build --release -p focusweave-cli --features opencv-backend
-    cp target/release/focusweave target/focusweave-opencv
-
-### Prerequisites for the OpenCV build
-
-The `opencv` crate compiles against OpenCV's headers and links its libraries,
-and it uses libclang to generate the bindings. Both have to be installed
-before `cargo build` will work.
+Then OpenCV. The `opencv` crate compiles against OpenCV's headers, links its
+libraries, and uses libclang to generate the bindings, so both OpenCV and LLVM
+have to be present before `cargo build` will work.
 
 Only `core` and `imgproc` are needed. Registration stays on this project's own
 ECC solver, which measures the same speed as OpenCV's; taking OpenCV's would
@@ -99,14 +56,20 @@ Chocolatey puts OpenCV in `C:\tools\opencv`. In the shell you build from
     $env:OPENCV_LINK_PATHS    = "C:\tools\opencv\build\x64\vc16\lib"
     $env:OPENCV_LINK_LIBS     = "opencv_world4130"   # or "opencv_core4130,opencv_imgproc4130"
     $env:LIBCLANG_PATH        = "C:\Program Files\LLVM\bin"
-    cargo build --release -p focusweave-cli --features opencv-backend
+    $env:PATH = "C:\Program Files\LLVM\bin;C:\tools\opencv\build\x64\vc16\bin;$env:PATH"
 
-The resulting `focusweave.exe` needs OpenCV's DLLs at run time, so either add
-`C:\tools\opencv\build\x64\vc16\bin` to `PATH` or copy the DLLs next to the
-executable. Chocolatey ships the monolithic `opencv_world` build, which
-carries every module whether or not it is used; a modular OpenCV build lets
-you ship just `opencv_core` and `opencv_imgproc`. vcpkg works too (`vcpkg install llvm opencv4`, with
-`VCPKG_ROOT` set), and the crate then discovers everything by itself.
+`LIBCLANG_PATH` tells the build script where to look; adding the same directory
+to `PATH` is what lets Windows actually load `libclang.dll` when the script
+runs. Setting only the first gives an opaque `exit code: 0xc0000135` from
+`build-script-build`, which is `STATUS_DLL_NOT_FOUND`.
+
+The OpenCV `bin` directory belongs on `PATH` too, because the resulting
+`focusweave.exe` loads those DLLs at run time; copying them next to the
+executable works as well. Chocolatey ships the monolithic `opencv_world` build,
+which carries every module whether or not it is used; a modular OpenCV build
+lets you ship just `opencv_core` and `opencv_imgproc`. vcpkg works too
+(`vcpkg install llvm opencv4`, with `VCPKG_ROOT` set), and the crate then
+discovers everything by itself.
 
 **macOS:**
 
@@ -115,14 +78,21 @@ you ship just `opencv_core` and `opencv_imgproc`. vcpkg works too (`vcpkg instal
 These Windows and macOS steps follow the `opencv` crate's own setup, which is
 the authoritative reference if something does not line up —
 [its README](https://github.com/twistedfall/opencv-rust#getting-opencv) lists
-every environment variable it reads. They have not been verified on those
-platforms from this repository; CI covers the Linux path only.
+every environment variable it reads.
+
+
+2. Build
+--------
+
+    cargo build --release -p focusweave-cli
+
+The binary lands at `target/release/focusweave` (`focusweave.exe` on Windows).
+It is about 3.8 MB and links OpenCV's `core` and `imgproc` dynamically, another
+8.2 MB on Ubuntu.
 
 
 3. Run the CLI
 --------------
-
-The binary lands at `target/release/focusweave` (`focusweave.exe` on Windows).
 
     ./target/release/focusweave --help
     ./target/release/focusweave path/to/images/
@@ -139,23 +109,22 @@ Three flags to know about while testing:
 - `--workers N` sets how many frames are fused at once. The default is
   automatic: one per core, capped so the workers' buffers fit in free memory,
   since each costs roughly 110 MB per megapixel of output. Coarse parallelism
-  over frames is what scales in the default build — much of fusing a frame is
-  per-pixel work no individual kernel parallelises — so this is the knob that
-  matters most. The line `Fusing (N workers)` reports what was chosen.
+  over frames is what scales here — much of fusing a frame is per-pixel work no
+  individual kernel parallelises — so this is the knob that matters most. The
+  line `Fusing (N workers)` reports what was chosen.
 - `--no-align` skips registration. Useful for isolating the fusion stage when
   comparing output against the old implementation.
-- `--timings` prints where the time went, and which kernels the binary was
-  built with. Start here if a run is slower than you expect:
+- `--timings` prints where the time went. Start here if a run is slower than
+  you expect:
 
       focusweave path/to/images/ --output out.png --timings
 
       Timings
-        build          native kernels
         threads        4 available
         loading          0.00s   0.0%
-        aligning         4.07s  31.0%
-        stacking         9.01s  68.6%
-        total           13.13s
+        aligning         1.93s  30.9%
+        stacking         4.27s  68.4%
+        total            6.25s
 
 
 4. Build and use the Python package
@@ -176,18 +145,24 @@ or build a wheel to install elsewhere:
     maturin build --release --out dist
     pip install --find-links dist focusweave
 
-The backend choice from [Pick a build](#2-pick-a-build) applies here too, and
-is worth the same on this side — on the benchmark set the default wheel takes
-3.8 s and the OpenCV-backed one 2.3 s:
+Building a *wheel* also needs `patchelf` on Linux (`pip install patchelf`),
+because maturin bundles the shared libraries into it. On Ubuntu 24.04 that
+wheel comes out at **10.0 MB compressed, 26 MB unpacked**:
 
-    maturin develop --release --features opencv-backend
+| part                                    | unpacked |
+| --------------------------------------- | -------- |
+| `libopencv_imgproc` + `libopencv_core`   | 8.8 MB   |
+| `_core.abi3.so` (FocusWeave itself)      | 4.1 MB   |
+| LAPACK, BLAS, libgfortran                | 11.3 MB  |
+| TBB, X11, GL stubs                       | 1.5 MB   |
 
-Building a *wheel* that way also needs `patchelf` on Linux
-(`pip install patchelf`), because maturin has to bundle the shared libraries
-into it. That is the distribution cost made concrete: the wheel comes out at
-about 13.5 MB instead of 1.5 MB, carrying OpenCV plus libprotobuf, libtbb and
-the rest of its dependency chain inside it — a second private copy of OpenCV
-alongside whatever `cv2` the environment already has.
+The bottom two rows are worth knowing about: nothing in FocusWeave calls
+LAPACK, BLAS or GL, but Ubuntu's `libopencv_core` is linked against them, so
+`auditwheel` pulls them in. An OpenCV built with `-DBUILD_LIST=core,imgproc
+-DWITH_LAPACK=OFF -DWITH_OPENGL=OFF` would cut the wheel to roughly a third of
+this. That is the trade being made: a wheel that carries a private copy of
+OpenCV alongside whatever `cv2` the environment already has, in exchange for
+the speed in [What to look at first](#7-what-to-look-at-first).
 
 The public API is unchanged, so anything written against the old package keeps
 working:
@@ -239,9 +214,10 @@ result = stacker.finish()
 ```
 
 `focusweave.load_image` and `focusweave.save_image` are new. The old package
-leaned on `cv2` for file I/O in its examples; since OpenCV is no longer a
-dependency, the package provides its own. `python -m focusweave.api_example
-path/to/images/ --streaming` runs a worked example.
+leaned on `cv2` for file I/O in its examples; the Rust package links OpenCV but
+does not re-export it, and numpy is still its only Python dependency, so it
+provides its own. `python -m focusweave.api_example path/to/images/ --streaming`
+runs a worked example.
 
 The `focusweave` console script is installed with the wheel and is the same
 CLI as the native binary — both call the same Rust argument parser.
@@ -289,27 +265,27 @@ and each script also runs standalone. What they cover:
 
 Expected results, which the scripts assert:
 
-- Filters, resampling and warping are exact or differ by one unit in the last
-  place on rounding ties.
+- Filtering, resampling, warping and colour conversion go through the same
+  OpenCV routines the reference calls, so they are exact against the same
+  OpenCV. The harness normally runs a pip `opencv-python` against a system
+  OpenCV of a different major version, and then a few of them drift: cubic
+  `warpAffine` by up to 2 of 255 and wide `GaussianBlur` by about 5e-5. Both
+  are version differences in OpenCV's own fixed-point tables, not the port.
+- With `--no-align`, stacked output differs from the reference by at most 1 of
+  255, on a handful of pixels.
 - Phase correlation agrees to about 3e-6 px.
 - Unmasked ECC agrees to about 1e-7; masked ECC, which is what the pipeline
-  actually uses, agrees to within 0.07 px of translation.
-- With `--no-align`, stacked output differs by at most 2 of 255. With
-  alignment, by at most 16 of 255 on synthetic high-frequency texture, mean
-  0.3 — that is the sub-pixel registration difference showing up as resampling
-  noise, not a change in what the algorithm does.
+  actually uses, agrees to within 0.07 px of translation. That is the port's
+  one real numerical difference, and it is why aligned output can differ by a
+  dozen levels on high-frequency texture — sub-pixel registration showing up
+  as resampling noise, not a change in what the algorithm does.
 
-`cargo test` covers the parts that stand alone from image data: border modes,
-the 2x2 SVD, warp constraints, pyramid round-tripping, canvas layout, slab
-index arithmetic.
+`cargo test` covers the parts that stand alone from image data: the 2x2 SVD,
+warp constraints, pyramid round-tripping, canvas layout, slab index arithmetic,
+DFT sizing.
 
-To check the OpenCV build instead, point the pipeline stage at that binary:
-
-    FOCUSWEAVE_BIN=$PWD/target/focusweave-opencv python tests/compare_pipeline.py
-
-It comes out bit-exact against the reference on `--no-align`, which is the
-cleanest confirmation that the two backends differ only in their kernels and
-that the fusion arithmetic is shared.
+`tests/compare_pipeline.py` honours `FOCUSWEAVE_BIN` if you want to point it at
+a binary somewhere other than `target/release/focusweave`.
 
 
 7. What to look at first
@@ -322,46 +298,33 @@ to you:
 have a known-good result for and compare. This is the check that matters; the
 synthetic tests only prove the port is faithful, not that you like the output.
 
-**Speed.** There are two builds. The default uses the kernels in this
-repository; `--features opencv-backend` routes the image processing to OpenCV.
-On this machine (4 cores, 25 frames at 2592x1944, best of three):
+**Speed.** On 4 cores, 25 frames at 2592x1944, best of three:
 
-| build           | total   |
-| --------------- | ------- |
-| own kernels     | 10.0 s  |
-| OpenCV backend  | 7.3 s   |
-| Python + OpenCV | 10.0 s  |
+| build             | total   |
+| ----------------- | ------- |
+| Rust + OpenCV     | 6.3 s   |
+| Python + OpenCV   | 9.6 s   |
 
-Reproduce with `python tests/bench_all.py target/bigstack`, after building
-both binaries as that script's docstring describes.
+Reproduce with `python tests/bench_all.py target/bigstack`.
 
-The gap is entirely in stacking; alignment measures the same either way, which
-is why the OpenCV build only needs `imgproc`. Per core, the kernels compare
-like this (`RAYON_NUM_THREADS=1 cargo run --release -p focusweave-core
---example bench_primitives`, and again with `--features opencv-backend`):
+The margin is larger on a machine with more cores, because the Python
+implementation's fusion loop is per-frame NumPy and the Rust one fuses several
+frames at once on rayon: on 20 threads the same set takes 6.0 s against 9.8 s.
 
-| kernel                        | own kernels | OpenCV |
-| ----------------------------- | ----------- | ------ |
-| `sepFilter2D` 5-tap RGB f32   | 47 ms       | 23 ms  |
-| `sepFilter2D` 5-tap gray f32  | 16 ms       | 3 ms   |
-| `GaussianBlur` 15 gray        | 22 ms       | 6 ms   |
-| `warpAffine` cubic RGB u8     | 231 ms      | 63 ms  |
-| `warpAffine` linear gray f32  | 56 ms       | 17 ms  |
-| `resize` INTER_AREA           | 42 ms       | 15 ms  |
-| RGB to Lab                    | 7 ms        | 17 ms  |
+That margin is smaller than a rewrite might promise, and the reason is worth
+stating plainly: the original was already calling OpenCV for the expensive
+parts, so the kernels never changed. What the port bought is the work *around*
+the kernels — threading that composes, one pass over the ECC normal equations
+instead of six materialised Jacobian planes, and no Python object churn per
+pyramid level — plus a single binary with no interpreter.
 
-Lab is the one the default build wins, because it only computes the channel
-the fusion weights actually use. Everything else is the SIMD gap: OpenCV
-dispatches hand-written AVX2 at runtime, while these loops are what the
-autovectoriser manages on its own.
-
-Three things mattered more than instruction set while getting here, and all
-three only showed up at scale. Fusing the separable filter's two passes, so
-the horizontally filtered intermediate never exists in full — the kernels are
-memory bound long before they are compute bound. Running the fusion workers on
-rayon's own pool rather than injecting from foreign threads. And sizing the
-worker pool to the machine: on twenty threads the old fixed default of three
-left stacking twice as slow as it needed to be.
+An earlier revision of this port implemented the kernels in Rust instead of
+linking OpenCV. It ran the full set in 10.0 s on the same machine — that is,
+level with the Python it replaced, and 1.6x slower than this. Those kernels
+were deleted; `git log` has them if the history is interesting. The lesson they
+taught is in [PORTING-NOTES.md](docs/PORTING-NOTES.md): memory traffic and
+scheduling shape mattered far more than the instruction set, and hand-written
+AVX2 is a hard thing to beat from an autovectoriser.
 
 **Alignment on a hard stack.** Macro stacks with lots of out-of-focus area are
 where the ECC differences would show. Run with `--no-align` and without, on
@@ -377,32 +340,32 @@ to be importable still is, from the same module paths.
 8. Troubleshooting
 ------------------
 
+**`build-script-build` exits with `0xc0000135` on Windows.** That code is
+`STATUS_DLL_NOT_FOUND`: the `opencv` crate's build script started but could not
+load `libclang.dll`. `LIBCLANG_PATH` alone is not enough — the LLVM `bin`
+directory has to be on `PATH` in the same shell, as in
+[Install the prerequisites](#1-install-the-prerequisites). Check with
+`where libclang.dll`, and note that a virtualenv activated from a different
+shell can carry a different `PATH` than the one you built the CLI in.
+
+**The build cannot find OpenCV.** The `opencv` crate reports what it looked for
+and where. On Linux it wants `pkg-config --modversion opencv4` to succeed; on
+Windows and macOS it usually needs `OPENCV_INCLUDE_PATHS`, `OPENCV_LINK_PATHS`,
+`OPENCV_LINK_LIBS` and `LIBCLANG_PATH` set. `cargo build -vv` shows the crate's
+own diagnostics.
+
+**It compiles but will not start.** OpenCV is linked dynamically, so the
+libraries have to be findable at run time: `PATH` on Windows,
+`LD_LIBRARY_PATH` on Linux, `DYLD_LIBRARY_PATH` on macOS. A package manager
+install normally puts them somewhere already searched.
+
 **It is slower than I expected.** Run it again with `--timings`. That prints
-which kernels the binary was built with, how many threads it can see, and how
-the time splits between alignment and stacking, which is enough to say where
-it is going. Three things to check first:
-
-- **Which build.** The default uses this project's own kernels and is the
-  slower of the two; `--features opencv-backend` is the fast one. `--timings`
-  says `native kernels` or `opencv kernels` outright.
-- **`--workers 0`.** The default of 3 is inherited from the Python
-  implementation. If `--timings` reports more than four threads available, the
-  default is under-using the machine.
-- **How big the set is.** Expect roughly linear scaling in total pixels; 25
-  frames at 2592x1944 take about 13 s with the default build and 8 s with the
-  OpenCV one on a four-core machine.
-
-**The OpenCV build cannot find OpenCV.** The `opencv` crate reports what it
-looked for and where. On Linux it wants `pkg-config --modversion opencv4` to
-succeed; on Windows and macOS it usually needs `OPENCV_INCLUDE_PATHS`,
-`OPENCV_LINK_PATHS`, `OPENCV_LINK_LIBS` and `LIBCLANG_PATH` set as in
-[Prerequisites](#prerequisites-for-the-opencv-build). `cargo build -vv` shows
-the crate's own diagnostics.
-
-**The OpenCV build compiles but will not start.** It links OpenCV
-dynamically, so the libraries have to be findable at run time: `PATH` on
-Windows, `LD_LIBRARY_PATH` on Linux, `DYLD_LIBRARY_PATH` on macOS. A package
-manager install normally puts them somewhere already searched.
+how many threads it can see and how the time splits between alignment and
+stacking, which is enough to say where it is going. Expect roughly linear
+scaling in total pixels; 25 frames at 2592x1944 take about 6 s on a four-core
+machine. If `--timings` reports plenty of threads and
+`Fusing (N workers)` reports few, the worker count was capped by free memory
+rather than by cores.
 
 **`cargo build` fails to fetch crates.** The build needs network access the
 first time. After that, `cargo build --offline` works.

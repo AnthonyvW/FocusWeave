@@ -1,11 +1,10 @@
-//! Primitives routed to the OpenCV C++ library, behind the `opencv-backend`
-//! feature.
+//! The image-processing primitives, supplied by OpenCV's `imgproc`.
 //!
-//! Only `imgproc` is routed here. Registration stays on this crate's own ECC
-//! solver and phase correlation: measured against OpenCV's they run at the
-//! same speed, and `opencv_video` exists solely to supply `findTransformECC`,
-//! which drags in dnn, calib3d, features2d and flann - 6.7 MB of the 16 MB
-//! this would otherwise link, for no gain.
+//! Only `imgproc` is used. Registration stays on this crate's own ECC solver
+//! and phase correlation: measured against OpenCV's they run at the same
+//! speed, and `opencv_video` exists solely to supply `findTransformECC`, which
+//! drags in dnn, calib3d, features2d and flann - 6.7 MB of linked code for no
+//! gain.
 //!
 //! Conversion in both directions borrows rather than copies, so timings
 //! reflect OpenCV's kernels and not marshalling overhead.
@@ -13,10 +12,23 @@
 use crate::affine::Affine;
 use crate::border::Border;
 use crate::mat::{Mat, MatU16, MatU8};
-use crate::warp::Interp;
 use opencv::core::{BorderTypes, Mat as CvMat, Point, Scalar, Size};
 use opencv::imgproc;
 use opencv::prelude::*;
+
+/// Resampling kernel, mapped straight onto OpenCV's interpolation flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interp {
+    Linear,
+    Cubic,
+    Nearest,
+}
+
+/// OpenCV's `cvRound`, which rounds halves to even like the hardware does.
+#[inline]
+pub fn cv_round(v: f64) -> i32 {
+    v.round_ties_even() as i32
+}
 
 fn border_flag(border: Border) -> i32 {
     match border {
@@ -108,6 +120,27 @@ pub fn sep_filter(src: &Mat, kx: &[f32], ky: &[f32], border: Border) -> Mat {
         border_flag(border),
     )
     .expect("sepFilter2D");
+    drop(dst);
+    out
+}
+
+/// `cv2.filter2D` with a single-channel kernel and `CV_32F` output.
+pub fn filter_2d(src: &Mat, kernel: &Mat, border: Border) -> Mat {
+    assert_eq!(kernel.c, 1, "filter kernels are single channel");
+    as_cv!(flat_input, input, src, f32);
+    as_cv!(flat_kernel, kernel_cv, kernel, f32);
+    let mut out = Mat::new(src.h, src.w, src.c);
+    out_cv!(flat_out, dst, &mut out, f32);
+    imgproc::filter_2d(
+        &input,
+        &mut dst,
+        opencv::core::CV_32F,
+        &kernel_cv,
+        Point::new(-1, -1),
+        0.0,
+        border_flag(border),
+    )
+    .expect("filter2D");
     drop(dst);
     out
 }
@@ -276,9 +309,9 @@ pub fn resize_area_u8(src: &MatU8, dst_w: usize, dst_h: usize) -> MatU8 {
 
 fn interp_flag(interp: Interp) -> i32 {
     match interp {
-        Interp::Linear | Interp::LinearQuantised => imgproc::INTER_LINEAR,
+        Interp::Linear => imgproc::INTER_LINEAR,
         Interp::Cubic => imgproc::INTER_CUBIC,
-        Interp::Nearest | Interp::NearestQuantised => imgproc::INTER_NEAREST,
+        Interp::Nearest => imgproc::INTER_NEAREST,
     }
 }
 
@@ -405,4 +438,9 @@ pub fn clahe(src: &MatU8, clip_limit: f64, tiles_x: usize, tiles_y: usize) -> Ma
     clahe.apply(&input, &mut dst).expect("CLAHE apply");
     drop(dst);
     out
+}
+
+/// Lab lightness as `f32`, which is how the fusion code consumes it.
+pub fn rgb_to_lab_l_f32(src: &MatU8) -> Mat {
+    rgb_to_lab_l_u8(src).to_f32()
 }
