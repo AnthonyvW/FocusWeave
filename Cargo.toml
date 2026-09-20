@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/focusweave-core",
+    "crates/focusweave-py",
+    "crates/focusweave-cli",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/AnthonyvW/FocusWeave"
+
+[workspace.dependencies]
+focusweave-core = { path = "crates/focusweave-core" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+rayon = "1.10"
+rustfft = "6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

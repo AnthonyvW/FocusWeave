@@ -1,21 +1,30 @@
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "focusweave"
-version = "1.2.0"
+version = "2.0.0"
 description = "Focus stacking via Laplacian pyramid fusion"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=2.4.4",
-    "opencv-python-headless>=4.13.0.92",
-    "pillow>=12.2.0",
-    "scipy>=1.17.1",
+    "numpy>=1.24",
+]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
 ]
 
-[project.optional-dependencies]
-gui = ["opencv-python>=4.13.0.92"]
+[project.urls]
+Homepage = "https://github.com/AnthonyvW/FocusWeave"
 
 [project.scripts]
 focusweave = "focusweave.main:main"
+
+[tool.maturin]
+manifest-path = "crates/focusweave-py/Cargo.toml"
+module-name = "focusweave._core"
+python-source = "python"
+features = ["pyo3/extension-module"]

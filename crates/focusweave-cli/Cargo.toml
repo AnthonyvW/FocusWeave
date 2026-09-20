@@ -1,0 +1,15 @@
+[package]
+name = "focusweave-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Focus stacking via Laplacian pyramid fusion (command line interface)"
+
+[[bin]]
+name = "focusweave"
+path = "src/main.rs"
+
+[dependencies]
+focusweave-core.workspace = true

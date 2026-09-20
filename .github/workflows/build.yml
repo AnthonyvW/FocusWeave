@@ -1,56 +1,104 @@
-name: Build Executables
+name: Build
 
 on:
   release:
     types: [published]
+  push:
+    branches: [main, rust]
+  pull_request:
   workflow_dispatch:
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            artifact_name: FocusWeave-windows
-            built_path: dist/FocusWeave.exe
-            release_name: FocusWeave-windows.exe
-            output_name: FocusWeave.exe
-          - os: ubuntu-latest
-            artifact_name: FocusWeave-linux
-            built_path: dist/FocusWeave
-            release_name: FocusWeave-linux
-            output_name: FocusWeave
-
-    runs-on: ${{ matrix.os }}
-
-    permissions:
-      contents: write
-
+  check:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+  compare:
+    name: Compare against the reference implementation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - run: pip install -r tests/requirements.txt maturin
+      - run: cargo build --release -p focusweave-cli
+      - run: maturin build --release --out dist
+      - run: pip install --find-links dist --force-reinstall focusweave
+      - run: python tests/run_all.py
 
-      - name: Install dependencies
+  binaries:
+    name: Binary (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: FocusWeave-linux
+            built: target/release/focusweave
+            release_name: FocusWeave-linux
+          - os: windows-latest
+            artifact: FocusWeave-windows
+            built: target/release/focusweave.exe
+            release_name: FocusWeave-windows.exe
+          - os: macos-latest
+            artifact: FocusWeave-macos
+            built: target/release/focusweave
+            release_name: FocusWeave-macos
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p focusweave-cli
+      - name: Name the artifact for release
+        shell: bash
         run: |
-          pip install .
-          pip install pyinstaller
-
-      - name: Build executable
-        run: pyinstaller focusweave.spec
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+          mkdir -p upload
+          cp "${{ matrix.built }}" "upload/${{ matrix.release_name }}"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: upload/${{ matrix.release_name }}
+      - uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
         with:
-          files: ${{ matrix.built_path }}
+          files: upload/${{ matrix.release_name }}
 
-      - name: Upload as workflow artifact
-        uses: actions/upload-artifact@v6
+  wheels:
+    name: Wheel (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.built_path }}
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'release'
+        with:
+          files: dist/*

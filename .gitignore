@@ -2,7 +2,10 @@
 *.jpg
 *.png
 venv/
+.venv/
 __pycache__/
 focusweave.egg-info/
 build/
 dist/
+target/
+*.whl

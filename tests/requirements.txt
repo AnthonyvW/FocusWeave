@@ -1,0 +1,4 @@
+# Dependencies for the comparison harness only. The focusweave package itself
+# needs nothing but numpy.
+numpy>=1.24
+opencv-python-headless>=4.9

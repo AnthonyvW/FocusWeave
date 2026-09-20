@@ -5,11 +5,16 @@ Focus stacking via Laplacian pyramid fusion. Takes a set of images captured at
 different focus distances and combines them into a single image where the entire
 subject is sharp.
 
+Written in Rust with Python bindings. Every image-processing routine the
+pipeline needs is implemented in this repository, so there is no OpenCV to
+install and nothing to link against — the command line binary is a single
+self-contained file of about 3 MB.
+
 Download
 --------
-Pre-built executables for Windows and Ubuntu are available on the
-[releases tab](https://github.com/AnthonyvW/FocusWeave/releases). Download
-the binary for your platform.
+Pre-built executables for Windows, macOS and Linux are available on the
+[releases tab](https://github.com/AnthonyvW/FocusWeave/releases), alongside
+Python wheels. Download the binary for your platform.
 
 Basic usage
 -----------
@@ -42,7 +47,7 @@ Command-line options
                             chaining through neighbours. More robust when images are not
                             ordered by similarity.
     --full-res              Run the fine alignment pass at full resolution instead of the
-                            default 2048px cap. More accurate but significantly slower.
+                            default 1024px cap. More accurate but significantly slower.
     --min-shift PIXELS      Minimum shift in pixels before alignment is applied (default: 5.0).
     --no-rotation           Suppress rotation correction during alignment.
     --no-scale              Suppress scale correction during alignment.
@@ -63,19 +68,17 @@ Command-line options
                             the sharpest image more aggressively at each pixel, approaching
                             a hard winner-take-all selection. Useful range is roughly
                             1.0 (soft blend) to 8.0 (near-hard selection).
-    --dark-threshold VALUE  Luminance threshold (0–255) below which chroma is suppressed
-                            toward neutral (default: 30.0). Prevents colour drift in dark
-                            regions caused by floating-point reconstruction error.
     --workers N             Number of parallel stacking workers (default: 3). Higher values
                             are faster but increase peak RAM by ~100 MiB per additional
                             worker. Set to 0 to use all CPU cores.
 
     Culling options
     --cull [THRESHOLD]      Remove wholly out-of-focus images before stacking. Each frame
-                            is scored by its Tenengrad response; frames below THRESHOLD ×
-                            peak score are dropped. THRESHOLD defaults to 0.6 when --cull is
-                            given without a value. At least the two sharpest frames are
-                            always retained. Raise toward 1.0 to cull more aggressively.
+                            is scored by the high- to low-frequency energy ratio of its
+                            Tenengrad response; frames scoring below THRESHOLD are dropped.
+                            The threshold is absolute, not relative to the sharpest frame.
+                            THRESHOLD defaults to 0.6 when --cull is given without a value.
+                            At least the two sharpest frames are always retained.
 
 **Slabbing options**
 
@@ -102,6 +105,8 @@ processing time, set workers to 1:
 
     focusweave path/to/images/ --workers 1
 
+Set `--workers 0` to use every core.
+
 Python API
 ----------
 focusweave can be installed as a dependency in your own project and used
@@ -120,7 +125,8 @@ Or install it into your environment directly:
     pip install "focusweave @ git+https://github.com/AnthonyvW/FocusWeave.git"
 
 All public symbols are importable from the top-level `focusweave` package.
-The main entry point is `FocusStackConfig` and `run`:
+Only numpy is required at runtime. The main entry point is `FocusStackConfig`
+and `run`:
 
 ```python
 from pathlib import Path
@@ -176,15 +182,53 @@ except Interrupted:
     print("Stack cancelled.")
 ```
 
-See `api_example.py` for a more complete example.
+Images can be read and written without pulling in another imaging library:
 
-Installation from source
-------------------------
-If you prefer to install from source, Python 3.10 or newer is required:
+```python
+from focusweave import load_image, save_image
 
-    pip install .
+frame = load_image(Path("frame_00.tiff"))   # uint8 or uint16 RGB
+save_image(result.image, Path("stacked.tiff"))
+```
 
-Once installed, the `focusweave` command is available on your PATH.
+See `python/focusweave/api_example.py` for a more complete example, or run it:
+
+    python -m focusweave.api_example path/to/images/ --streaming
+
+Building from source
+--------------------
+A Rust toolchain (1.82 or newer) is required; Python 3.10 or newer if you want
+the bindings.
+
+Command line binary:
+
+    cargo build --release -p focusweave-cli
+    ./target/release/focusweave --help
+
+Python package, via [maturin](https://maturin.rs):
+
+    pip install maturin
+    maturin develop --release
+
+Once installed, the `focusweave` command is available on your PATH and is the
+same CLI as the native binary.
+
+[RUNNING.md](RUNNING.md) walks through building, testing and benchmarking in
+more detail. [docs/PORTING-NOTES.md](docs/PORTING-NOTES.md) records how the
+Rust implementation relates to the original Python one, including where the two
+deliberately differ.
+
+Testing
+-------
+The original pure-Python/OpenCV implementation is preserved under
+`tests/reference/`, and the port is validated against it:
+
+    pip install -r tests/requirements.txt
+    cargo build --release -p focusweave-cli
+    maturin develop --release
+    python tests/run_all.py
+
+`cargo test` covers the parts that stand alone from image data.
 
 Algorithms
 ----------
@@ -193,8 +237,9 @@ The focus stacking algorithm is based on Laplacian pyramid fusion as described i
 > Wang, W., & Chang, F. (2011). A Multi-focus Image Fusion Method Based on
 > Laplacian Pyramid. *Journal of Computers*.
 
-Image alignment uses a custom coarse-to-fine pipeline built on top of OpenCV's
-`findTransformECC`. It seeds ECC with a phase-correlation translation estimate,
+Image alignment uses a custom coarse-to-fine pipeline built on an enhanced
+correlation coefficient solver (Evangelidis & Psarakis, 2008), implemented
+here. It seeds ECC with a phase-correlation translation estimate,
 applies CLAHE normalisation and a focus-aware pixel mask to concentrate the
 optimisation on sharp, informative regions, then validates the result against the
 seed to reject false minima. Warps are composed mathematically through a

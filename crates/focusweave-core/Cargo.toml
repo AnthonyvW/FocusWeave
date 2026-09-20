@@ -1,0 +1,13 @@
+[package]
+name = "focusweave-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Focus stacking via Laplacian pyramid fusion (core library)"
+
+[dependencies]
+image.workspace = true
+rayon.workspace = true
+rustfft.workspace = true
