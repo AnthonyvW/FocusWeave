@@ -127,12 +127,26 @@ old Python CLI is accepted, with identical names and defaults:
     ./target/release/focusweave path/to/images/ --cull --crop
     ./target/release/focusweave path/to/images/ --slab 20 5 --output-steps
 
-Two flags to know about while testing:
+Three flags to know about while testing:
 
-- `--workers 0` uses every core. The default is still 3, matching the old
-  behaviour and its memory profile.
+- `--workers 0` uses every core. The default is still 3, inherited from the
+  Python implementation where it was a memory trade-off. On anything with more
+  than four cores it is leaving performance on the table — worth 15% here and
+  more on a bigger machine.
 - `--no-align` skips registration. Useful for isolating the fusion stage when
   comparing output against the old implementation.
+- `--timings` prints where the time went, and which kernels the binary was
+  built with. Start here if a run is slower than you expect:
+
+      focusweave path/to/images/ --output out.png --timings
+
+      Timings
+        build          native kernels
+        threads        4 available
+        loading          0.00s   0.0%
+        aligning         4.07s  31.0%
+        stacking         9.01s  68.6%
+        total           13.13s
 
 
 4. Build and use the Python package
@@ -365,12 +379,20 @@ to be importable still is, from the same module paths.
 8. Troubleshooting
 ------------------
 
-**It is slower than I expected.** Check which build you are running. The
-default one uses this project's own kernels and is the slower of the two by
-about 25%; `--features opencv-backend` is the fast one. See
-[Pick a build](#2-pick-a-build). On Linux, `ldd target/release/focusweave |
-grep opencv` tells you which you have — the OpenCV build lists seven
-libraries, the default build lists none.
+**It is slower than I expected.** Run it again with `--timings`. That prints
+which kernels the binary was built with, how many threads it can see, and how
+the time splits between alignment and stacking, which is enough to say where
+it is going. Three things to check first:
+
+- **Which build.** The default uses this project's own kernels and is the
+  slower of the two; `--features opencv-backend` is the fast one. `--timings`
+  says `native kernels` or `opencv kernels` outright.
+- **`--workers 0`.** The default of 3 is inherited from the Python
+  implementation. If `--timings` reports more than four threads available, the
+  default is under-using the machine.
+- **How big the set is.** Expect roughly linear scaling in total pixels; 25
+  frames at 2592x1944 take about 13 s with the default build and 8 s with the
+  OpenCV one on a four-core machine.
 
 **The OpenCV build cannot find OpenCV.** The `opencv` crate reports what it
 looked for and where. On Linux it wants `pkg-config --modversion opencv4` to

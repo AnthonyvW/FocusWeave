@@ -13,6 +13,13 @@
 #[cfg(feature = "opencv-backend")]
 pub mod backend_opencv;
 
+/// Which set of image-processing kernels this build was compiled with.
+pub const BACKEND: &str = if cfg!(feature = "opencv-backend") {
+    "opencv"
+} else {
+    "native"
+};
+
 pub mod affine;
 pub mod align;
 pub mod border;

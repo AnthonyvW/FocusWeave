@@ -117,13 +117,17 @@ pub fn gaussian_blur(src: &Mat, ksize: usize, sigma: f64) -> Mat {
     as_cv!(flat_input, input, src, f32);
     let mut out = Mat::new(src.h, src.w, src.c);
     out_cv!(flat_out, dst, &mut out, f32);
-    imgproc::gaussian_blur(
+    // The `_def` form is used deliberately. OpenCV 4.11 added an
+    // `AlgorithmHint` parameter to GaussianBlur and cvtColor, so the explicit
+    // signatures differ between versions and will not compile against both.
+    // The defaults it supplies are exactly what this call wants anyway:
+    // sigmaY = 0 means "same as sigmaX", and BORDER_DEFAULT is
+    // BORDER_REFLECT_101.
+    imgproc::gaussian_blur_def(
         &input,
         &mut dst,
         Size::new(ksize as i32, ksize as i32),
         sigma,
-        sigma,
-        BorderTypes::BORDER_REFLECT_101 as i32,
     )
     .expect("GaussianBlur");
     drop(dst);
@@ -369,7 +373,9 @@ pub fn rgb_to_gray_u8(src: &MatU8) -> MatU8 {
     as_cv!(flat_input, input, src, u8);
     let mut out = MatU8::new(src.h, src.w, 1);
     out_cv!(flat_out, dst, &mut out, u8);
-    imgproc::cvt_color(&input, &mut dst, imgproc::COLOR_RGB2GRAY, 0).expect("cvtColor gray");
+    // `_def` for the same version-portability reason as GaussianBlur above;
+    // its default dstCn of 0 is what this call passed explicitly.
+    imgproc::cvt_color_def(&input, &mut dst, imgproc::COLOR_RGB2GRAY).expect("cvtColor gray");
     drop(dst);
     out
 }
@@ -378,7 +384,7 @@ pub fn rgb_to_lab_l_u8(src: &MatU8) -> MatU8 {
     as_cv!(flat_input, input, src, u8);
     let mut full = MatU8::new(src.h, src.w, 3);
     out_cv!(flat_out, lab, &mut full, u8);
-    imgproc::cvt_color(&input, &mut lab, imgproc::COLOR_RGB2Lab, 0).expect("cvtColor Lab");
+    imgproc::cvt_color_def(&input, &mut lab, imgproc::COLOR_RGB2Lab).expect("cvtColor Lab");
     drop(lab);
     MatU8 {
         h: full.h,

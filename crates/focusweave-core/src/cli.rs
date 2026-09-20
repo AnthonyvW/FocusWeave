@@ -4,8 +4,9 @@
 use crate::config::{run, FocusStackConfig, Images, RunResult};
 use crate::hooks::{Error, Hooks, Stage};
 use crate::image_source::{save_image, ImageBuf, IMAGE_EXTENSIONS};
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -60,6 +61,8 @@ Slabbing options
   --slab-format EXT       File format for slab images (default: tiff).
 
 Other
+  --timings               Print how long each stage took, and what this build is,
+                          after the run. Useful when reporting a slow run.
   --version               Show the version number and exit.
   --formats               List the supported image extensions and exit.
   --help                  Show this message and exit.
@@ -73,6 +76,7 @@ struct Args {
     slab_format: Option<String>,
     output_steps: bool,
     only_slab: bool,
+    timings: bool,
 }
 
 struct Parsed {
@@ -122,6 +126,7 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
             "--output" => args.output = Some(PathBuf::from(next(&mut i, "output")?)),
             "--quality" => args.quality = Some(parse_number("quality", &next(&mut i, "quality")?)?),
             "--slab-format" => args.slab_format = Some(next(&mut i, "slab-format")?),
+            "--timings" => args.timings = true,
             "--output-steps" => args.output_steps = true,
             "--only-slab" => {
                 args.only_slab = true;
@@ -191,6 +196,61 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
     Ok(Some(Parsed { cfg, args }))
 }
 
+/// Accumulates wall time per pipeline stage from the progress callback.
+#[derive(Default)]
+struct StageTimer {
+    current: Option<(Stage, Instant)>,
+    totals: Vec<(Stage, Duration)>,
+}
+
+impl StageTimer {
+    fn observe(&mut self, stage: Stage) {
+        match self.current {
+            Some((previous, _)) if previous == stage => {}
+            _ => {
+                if let Some((previous, started)) = self.current.take() {
+                    self.record(previous, started.elapsed());
+                }
+                self.current = Some((stage, Instant::now()));
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some((stage, started)) = self.current.take() {
+            self.record(stage, started.elapsed());
+        }
+    }
+
+    fn record(&mut self, stage: Stage, elapsed: Duration) {
+        match self.totals.iter_mut().find(|(s, _)| *s == stage) {
+            Some((_, total)) => *total += elapsed,
+            None => self.totals.push((stage, elapsed)),
+        }
+    }
+
+    fn report(&self, total: Duration) {
+        println!("\nTimings");
+        println!("  build          {} kernels", crate::BACKEND);
+        println!("  threads        {} available", available_threads());
+        for (stage, elapsed) in &self.totals {
+            let share = elapsed.as_secs_f64() / total.as_secs_f64() * 100.0;
+            println!(
+                "  {:<14} {:6.2}s  {share:4.1}%",
+                stage.as_str(),
+                elapsed.as_secs_f64()
+            );
+        }
+        println!("  {:<14} {:6.2}s", "total", total.as_secs_f64());
+    }
+}
+
+fn available_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(0)
+}
+
 /// Run the command line interface. Returns the process exit code.
 pub fn run_cli(argv: &[String]) -> i32 {
     let parsed = match parse(argv) {
@@ -234,7 +294,11 @@ fn execute(parsed: Parsed) -> Result<(), Error> {
     let slab_ext = args.slab_format.clone().unwrap_or_else(|| "tiff".into());
     let slab_ext = slab_ext.trim_start_matches('.').to_string();
 
-    let progress = |fraction: f64, _stage: Stage, message: &str| {
+    let timer = RefCell::new(StageTimer::default());
+    let progress = |fraction: f64, stage: Stage, message: &str| {
+        if args.timings {
+            timer.borrow_mut().observe(stage);
+        }
         if !message.is_empty() {
             println!("  {:5.1}%  {message}", fraction * 100.0);
         }
@@ -264,6 +328,9 @@ fn execute(parsed: Parsed) -> Result<(), Error> {
 
     let start = Instant::now();
     let result: RunResult = run(&cfg, &hooks)?;
+    if args.timings {
+        timer.borrow_mut().finish();
+    }
 
     if let Some(slabs) = result.slabs {
         if emit_steps {
@@ -271,6 +338,9 @@ fn execute(parsed: Parsed) -> Result<(), Error> {
         }
         println!("Produced {} slab(s)", slabs.len());
         println!("Done ({:.2}s total)", start.elapsed().as_secs_f64());
+        if args.timings {
+            timer.borrow().report(start.elapsed());
+        }
         return Ok(());
     }
 
@@ -285,5 +355,8 @@ fn execute(parsed: Parsed) -> Result<(), Error> {
         t_save.elapsed().as_secs_f64()
     );
     println!("Done ({:.2}s total)", start.elapsed().as_secs_f64());
+    if args.timings {
+        timer.borrow().report(start.elapsed());
+    }
     Ok(())
 }
