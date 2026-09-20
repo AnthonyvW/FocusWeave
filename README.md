@@ -202,20 +202,24 @@ Building from source
 A Rust toolchain (1.82 or newer) is required; Python 3.10 or newer if you want
 the bindings.
 
+There are two builds. The default needs nothing but Rust and produces a
+self-contained binary. The `opencv-backend` one calls the OpenCV C++ library
+for its image processing and is about 25% faster, at the cost of needing
+OpenCV 4 development files and libclang to build and linking OpenCV's shared
+libraries at run time. **If you are benchmarking, build that one** —
+[RUNNING.md](RUNNING.md) has the per-platform prerequisites and the numbers.
+
 Command line binary:
 
-    cargo build --release -p focusweave-cli
+    cargo build --release -p focusweave-cli                            # default
+    cargo build --release -p focusweave-cli --features opencv-backend  # faster
     ./target/release/focusweave --help
-
-Or, linking OpenCV instead of this project's own kernels (needs OpenCV 4
-headers, libraries and libclang):
-
-    cargo build --release -p focusweave-cli --features opencv-backend
 
 Python package, via [maturin](https://maturin.rs):
 
     pip install maturin
-    maturin develop --release
+    maturin develop --release                            # default
+    maturin develop --release --features opencv-backend  # faster
 
 Once installed, the `focusweave` command is available on your PATH and is the
 same CLI as the native binary.

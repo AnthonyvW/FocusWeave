@@ -1,21 +1,27 @@
 Running the Rust FocusWeave
 ===========================
 
-FocusWeave is now a Rust workspace with Python bindings. Everything the
-pipeline needs — image decoding, filtering, CLAHE, phase correlation, the ECC
-solver, pyramid fusion — is implemented in this repository, so there is no
-OpenCV to install and nothing to link against. You need a Rust toolchain, and
-Python only if you want the bindings.
+FocusWeave is now a Rust workspace with Python bindings.
+
+**There are two builds, and the difference matters.** The default one uses the
+image-processing kernels implemented in this repository and needs nothing but
+a Rust toolchain. The `opencv-backend` one calls the OpenCV C++ library
+instead and is the faster of the two — about 25% on a full run. If you are
+timing FocusWeave against the old Python implementation, build that one, or
+you are comparing this project's hand-written kernels against OpenCV's
+hand-written SIMD and the Python will look good. [Pick a build](#2-pick-a-build)
+has both commands and what each needs installed.
 
 Contents:
 
 1. [Get a toolchain](#1-get-a-toolchain)
-2. [Build and run the CLI](#2-build-and-run-the-cli)
-3. [Build and use the Python package](#3-build-and-use-the-python-package)
-4. [Make yourself a test stack](#4-make-yourself-a-test-stack)
-5. [Check it against the old implementation](#5-check-it-against-the-old-implementation)
-6. [What to look at first](#6-what-to-look-at-first)
-7. [Troubleshooting](#7-troubleshooting)
+2. [Pick a build](#2-pick-a-build)
+3. [Run the CLI](#3-run-the-cli)
+4. [Build and use the Python package](#4-build-and-use-the-python-package)
+5. [Make yourself a test stack](#5-make-yourself-a-test-stack)
+6. [Check it against the old implementation](#6-check-it-against-the-old-implementation)
+7. [What to look at first](#7-what-to-look-at-first)
+8. [Troubleshooting](#8-troubleshooting)
 
 
 1. Get a toolchain
@@ -31,18 +37,85 @@ Check it:
 
     cargo --version
 
-That is the only hard requirement. The rest of this guide is optional
-depending on what you want to try.
+That is all the default build needs. The OpenCV build needs a little more,
+below.
 
 
-2. Build and run the CLI
-------------------------
+2. Pick a build
+---------------
+
+Both builds accept the same flags and produce the same picture. They differ
+only in whose image-processing kernels run underneath.
+
+| | default | `--features opencv-backend` |
+| --- | --- | --- |
+| command | `cargo build --release -p focusweave-cli` | `cargo build --release -p focusweave-cli --features opencv-backend` |
+| needs | a Rust toolchain | OpenCV 4 development files, plus libclang |
+| speed | baseline | ~25% faster overall, ~3x on some kernels |
+| result | self-contained 3.5 MB binary | 2.7 MB binary plus ~16 MB of OpenCV shared libraries |
+| output | within a few LSB of the original | identical to the original without alignment, within a few LSB with it |
+
+**Build the OpenCV one if speed is what you care about.** The numbers are in
+[What to look at first](#7-what-to-look-at-first); the short version is that
+the default build's kernels are scalar Rust and OpenCV's are hand-written
+AVX2, and no amount of threading closes that on its own.
+
+Both write to the same path, `target/release/focusweave`, so copy each aside
+if you want to compare them:
 
     cargo build --release -p focusweave-cli
+    cp target/release/focusweave target/focusweave-native
+
+    cargo build --release -p focusweave-cli --features opencv-backend
+    cp target/release/focusweave target/focusweave-opencv
+
+### Prerequisites for the OpenCV build
+
+The `opencv` crate compiles against OpenCV's headers and links its libraries,
+and it uses libclang to generate the bindings. Both have to be installed
+before `cargo build` will work.
+
+**Linux (Debian, Ubuntu):**
+
+    sudo apt-get install libopencv-dev libclang-dev
+
+That is all — the crate finds everything through `pkg-config`.
+
+**Windows:** install OpenCV and LLVM, then point the crate at them. With
+[Chocolatey](https://chocolatey.org):
+
+    choco install llvm opencv
+
+Chocolatey puts OpenCV in `C:\tools\opencv`. In the shell you build from
+(PowerShell here; adjust the version number to match what was installed, and
+`vc16` to your toolset):
+
+    $env:OPENCV_INCLUDE_PATHS = "C:\tools\opencv\build\include"
+    $env:OPENCV_LINK_PATHS    = "C:\tools\opencv\build\x64\vc16\lib"
+    $env:OPENCV_LINK_LIBS     = "opencv_world4120"
+    $env:LIBCLANG_PATH        = "C:\Program Files\LLVM\bin"
+    cargo build --release -p focusweave-cli --features opencv-backend
+
+The resulting `focusweave.exe` needs OpenCV's DLLs at run time, so either add
+`C:\tools\opencv\build\x64\vc16\bin` to `PATH` or copy `opencv_world*.dll`
+next to the executable. vcpkg works too (`vcpkg install llvm opencv4`, with
+`VCPKG_ROOT` set), and the crate then discovers everything by itself.
+
+**macOS:**
+
+    brew install opencv llvm
+
+These Windows and macOS steps follow the `opencv` crate's own setup, which is
+the authoritative reference if something does not line up —
+[its README](https://github.com/twistedfall/opencv-rust#getting-opencv) lists
+every environment variable it reads. They have not been verified on those
+platforms from this repository; CI covers the Linux path only.
+
+
+3. Run the CLI
+--------------
 
 The binary lands at `target/release/focusweave` (`focusweave.exe` on Windows).
-It is self-contained — about 3 MB, no shared libraries beyond libc — so you can
-copy it anywhere.
 
     ./target/release/focusweave --help
     ./target/release/focusweave path/to/images/
@@ -61,28 +134,8 @@ Two flags to know about while testing:
 - `--no-align` skips registration. Useful for isolating the fusion stage when
   comparing output against the old implementation.
 
-There is a second build that links OpenCV instead of using this project's own
-kernels:
 
-    cargo build --release -p focusweave-cli --features opencv-backend
-
-It is faster (see [Speed](#6-what-to-look-at-first)) and bit-exact with the
-original implementation, but it needs OpenCV 4 headers, libraries and
-libclang to build, and the resulting binary links seven OpenCV shared
-libraries rather than standing alone. On Debian or Ubuntu:
-
-    sudo apt-get install libopencv-dev libclang-dev
-
-Both builds write to `target/release/focusweave`, so copy each one aside if
-you want to compare them:
-
-    cargo build --release -p focusweave-cli
-    cp target/release/focusweave target/focusweave-native
-    cargo build --release -p focusweave-cli --features opencv-backend
-    cp target/release/focusweave target/focusweave-opencv
-
-
-3. Build and use the Python package
+4. Build and use the Python package
 -----------------------------------
 
 The package is built with [maturin](https://maturin.rs). In a virtualenv:
@@ -99,6 +152,19 @@ or build a wheel to install elsewhere:
 
     maturin build --release --out dist
     pip install --find-links dist focusweave
+
+The backend choice from [Pick a build](#2-pick-a-build) applies here too, and
+is worth the same on this side — on the benchmark set the default wheel takes
+3.8 s and the OpenCV-backed one 2.3 s:
+
+    maturin develop --release --features opencv-backend
+
+Building a *wheel* that way also needs `patchelf` on Linux
+(`pip install patchelf`), because maturin has to bundle the shared libraries
+into it. That is the distribution cost made concrete: the wheel comes out at
+about 13.5 MB instead of 1.5 MB, carrying OpenCV plus libprotobuf, libtbb and
+the rest of its dependency chain inside it — a second private copy of OpenCV
+alongside whatever `cv2` the environment already has.
 
 The public API is unchanged, so anything written against the old package keeps
 working:
@@ -158,7 +224,7 @@ The `focusweave` console script is installed with the wheel and is the same
 CLI as the native binary — both call the same Rust argument parser.
 
 
-4. Make yourself a test stack
+5. Make yourself a test stack
 -----------------------------
 
 If you do not have a focus stack to hand, `tests/make_stack.py` generates a
@@ -175,7 +241,7 @@ The result should be sharp edge to edge, where each input frame is sharp only
 in one band.
 
 
-5. Check it against the old implementation
+6. Check it against the old implementation
 ------------------------------------------
 
 The original pure-Python/OpenCV code is preserved verbatim under
@@ -223,7 +289,7 @@ cleanest confirmation that the two backends differ only in their kernels and
 that the fusion arithmetic is shared.
 
 
-6. What to look at first
+7. What to look at first
 ------------------------
 
 Some things worth poking at, in rough order of how likely they are to matter
@@ -296,8 +362,27 @@ depth end to end.
 to be importable still is, from the same module paths.
 
 
-7. Troubleshooting
+8. Troubleshooting
 ------------------
+
+**It is slower than I expected.** Check which build you are running. The
+default one uses this project's own kernels and is the slower of the two by
+about 25%; `--features opencv-backend` is the fast one. See
+[Pick a build](#2-pick-a-build). On Linux, `ldd target/release/focusweave |
+grep opencv` tells you which you have — the OpenCV build lists seven
+libraries, the default build lists none.
+
+**The OpenCV build cannot find OpenCV.** The `opencv` crate reports what it
+looked for and where. On Linux it wants `pkg-config --modversion opencv4` to
+succeed; on Windows and macOS it usually needs `OPENCV_INCLUDE_PATHS`,
+`OPENCV_LINK_PATHS`, `OPENCV_LINK_LIBS` and `LIBCLANG_PATH` set as in
+[Prerequisites](#prerequisites-for-the-opencv-build). `cargo build -vv` shows
+the crate's own diagnostics.
+
+**The OpenCV build compiles but will not start.** It links OpenCV
+dynamically, so the libraries have to be findable at run time: `PATH` on
+Windows, `LD_LIBRARY_PATH` on Linux, `DYLD_LIBRARY_PATH` on macOS. A package
+manager install normally puts them somewhere already searched.
 
 **`cargo build` fails to fetch crates.** The build needs network access the
 first time. After that, `cargo build --offline` works.
