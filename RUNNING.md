@@ -92,7 +92,7 @@ Chocolatey puts OpenCV in `C:\tools\opencv`. In the shell you build from
 
     $env:OPENCV_INCLUDE_PATHS = "C:\tools\opencv\build\include"
     $env:OPENCV_LINK_PATHS    = "C:\tools\opencv\build\x64\vc16\lib"
-    $env:OPENCV_LINK_LIBS     = "opencv_world4120"
+    $env:OPENCV_LINK_LIBS     = "opencv_world4130"
     $env:LIBCLANG_PATH        = "C:\Program Files\LLVM\bin"
     cargo build --release -p focusweave-cli --features opencv-backend
 
