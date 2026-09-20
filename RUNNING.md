@@ -207,19 +207,36 @@ synthetic tests only prove the port is faithful, not that you like the output.
 
 **Speed.** On this machine (4 cores, 10 frames at 2000x1400):
 
-|                | Rust  | Python + OpenCV |
-| -------------- | ----- | --------------- |
-| full run       | 4.9 s | 3.2 s           |
-| `--no-align`   | 2.2 s | 1.8 s           |
-| peak memory    | 876 MiB | 1085 MiB      |
+|                       | Rust    | Python + OpenCV |
+| --------------------- | ------- | --------------- |
+| fusion only (`--no-align`) | 1.9 s | 2.2 s         |
+| full run              | 4.4 s   | 3.2 s           |
+| full run, `--workers 0` | 3.9 s |                 |
+| peak memory           | 926 MiB | 1085 MiB        |
 
-The Rust build is currently **slower**, by roughly 1.3x on fusion and 1.5x
-overall. OpenCV's inner loops are hand-written SIMD and mine are scalar; on a
-machine with more cores the gap narrows, because the Rust version has no GIL
-to work around. What the rewrite buys is a 3 MB dependency-free binary instead
-of a ~90 MB OpenCV install, and about 20% less peak memory. If speed is the
-point of the exercise, the remaining gap is almost entirely in `sep_filter`
-and the warp inner loop, and is addressable with explicit SIMD.
+Fusion is now faster than the OpenCV build. The full run is still about 1.3x
+behind, and all of that sits in alignment — specifically in `warp_affine`,
+which the ECC solver calls four times per iteration. Per core the kernels
+compare like this against OpenCV's SIMD:
+
+| kernel                        | Rust    | OpenCV  |
+| ----------------------------- | ------- | ------- |
+| `sepFilter2D` 5-tap RGB f32   | 44 ms   | 12 ms   |
+| `sepFilter2D` 5-tap gray f32  | 15 ms   | 2 ms    |
+| `GaussianBlur` 15 gray        | 23 ms   | 6 ms    |
+| `warpAffine` cubic RGB u8     | 225 ms  | 52 ms   |
+| `warpAffine` linear gray f32  | 52 ms   | 7 ms    |
+| RGB to Lab (L only)           | 7 ms    | 14 ms   |
+
+Two things to read from that. The Lab conversion is faster because the port
+only computes the channel the fusion weights actually use, which is an
+algorithmic win rather than a micro-optimised one. Everything else is the
+SIMD gap: OpenCV dispatches to AVX2 at runtime and accumulates a whole kernel
+in vector registers, while these loops are what the autovectoriser manages on
+its own. Closing it means hand-written SIMD in two functions — `sep_filter`
+and the warp inner loop — with runtime feature detection so the binary stays
+portable. `cargo run --release -p focusweave-core --example bench_primitives`
+reproduces the table, and `RAYON_NUM_THREADS=1` gives the per-core figures.
 
 **Alignment on a hard stack.** Macro stacks with lots of out-of-focus area are
 where the ECC differences would show. Run with `--no-align` and without, on

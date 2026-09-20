@@ -28,8 +28,19 @@ against them: `sepFilter2D`, `filter2D`, `boxFilter`, `sqrBoxFilter`,
 `findTransformECC`. Image decoding and encoding go through the `image` crate.
 
 That keeps the build free of system dependencies and the binary at about 3 MB,
-at the cost of scalar inner loops where OpenCV has SIMD. See RUNNING.md for
-the timing consequences.
+at the cost of scalar inner loops where OpenCV has SIMD.
+
+The alternative considered was the `opencv` crate, which binds the C++ library
+from Rust. It was rejected because it undoes what the rewrite is for: it needs
+OpenCV headers and libs plus libclang at build time on every platform, and it
+links dynamically, so the single-file binary becomes a binary plus a set of
+shared libraries. For the Python side it is worse — a self-contained wheel
+would have to bundle those libraries, so `pip install focusweave` pulls in
+OpenCV again, only now as a private second copy alongside whatever `cv2` the
+caller already has. At that point the Rust layer is replacing orchestration
+code that was never the bottleneck. It remains a reasonable choice for anyone
+who wants bit-identical parity with OpenCV and does not care about
+distribution; see RUNNING.md for where the remaining performance gap sits.
 
 Where the port is not bit-exact
 -------------------------------
@@ -128,11 +139,26 @@ knowing about before optimising further:
   coordinate weight, every entry of the Hessian and of the projections can be
   summed in a single traversal. This cut `run_ecc` from 3.1 s to 2.1 s on the
   benchmark set before any parallelism.
-- **Separable filtering splits margins from the interior.** Columns whose taps
-  all land inside the image skip border-index lookups entirely.
+- **Separable filtering splits margins from the interior, and accumulates one
+  tap at a time over contiguous slices.** Columns whose taps all land inside
+  the image skip border-index lookups entirely. Within the interior, tap `j`
+  of output element `i` lives at `base[i + j * c]` for any channel count, so
+  each tap is a contiguous slice of the source and the accumulation becomes a
+  multiply-add the autovectoriser can widen. Writing it as a per-element
+  gather instead — the obvious formulation — leaves it scalar. The column pass
+  gathers its contributing rows first and sums them in one traversal rather
+  than adding each tap into the destination separately, which would read and
+  rewrite the whole row once per tap.
 - **Dilation uses per-row prefix sums.** The structuring element's rows are
   contiguous runs, so "is any pixel in this window set" is a constant-time
   query rather than a scan of the neighbourhood.
+
+Those two changes took fusion from slower than the OpenCV build to faster than
+it. What remains is `warp_affine`, which the ECC solver calls four times per
+iteration and which is still several times slower per core than OpenCV's. That
+one needs real SIMD: OpenCV dispatches to AVX2 at runtime and keeps a whole
+kernel in vector registers, and neither `-C target-cpu=native` nor reshaping
+the loops gets close on its own.
 
 One pitfall worth recording: replacing a division by a reciprocal multiply in
 the fusion blend produced black patches. The denominator there can be

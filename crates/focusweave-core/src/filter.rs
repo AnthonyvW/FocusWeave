@@ -8,8 +8,16 @@ use crate::border::{border_table, Border};
 use crate::mat::Mat;
 use rayon::prelude::*;
 
+/// Longest separable kernel the column pass gathers on the stack. The widest
+/// in use is the 31-tap Gaussian of the focus scorer.
+const MAX_TAPS: usize = 64;
+
 /// Separable correlation, equivalent to `cv2.sepFilter2D` with `CV_32F` output.
 pub fn sep_filter(src: &Mat, kx: &[f32], ky: &[f32], border: Border) -> Mat {
+    assert!(
+        kx.len() <= MAX_TAPS && ky.len() <= MAX_TAPS,
+        "kernel longer than {MAX_TAPS} taps"
+    );
     let tmp = filter_rows(src, kx, border);
     filter_cols(&tmp, ky, border)
 }
@@ -52,43 +60,30 @@ fn filter_rows(src: &Mat, k: &[f32], border: Border) -> Mat {
                 margin(x, drow);
             }
 
-            match c {
-                1 => {
-                    for (x, out) in drow.iter_mut().enumerate().take(hi).skip(lo) {
-                        let base = x - anchor;
-                        let mut acc = 0.0f32;
-                        for (j, kv) in k.iter().enumerate() {
-                            acc += srow[base + j] * *kv;
-                        }
-                        *out = acc;
+            // Interior columns have every tap in range, so they need no border
+            // lookups. Tap `j` of output element `i` sits at `base[i + j * c]`
+            // whatever the channel count, so each tap is a contiguous slice of
+            // the source offset by `j * c` — an accumulate the autovectoriser
+            // turns into a plain multiply-add over whole vectors.
+            //
+            // An image narrower than the anchor has no interior at all; the
+            // margins above have already covered every column.
+            if hi <= lo || lo < anchor {
+                return;
+            }
+            let out = &mut drow[lo * c..hi * c];
+            let n = out.len();
+            let base = &srow[(lo - anchor) * c..];
+            for (j, kv) in k.iter().enumerate() {
+                let taps = &base[j * c..j * c + n];
+                let kv = *kv;
+                if j == 0 {
+                    for (d, s) in out.iter_mut().zip(taps) {
+                        *d = *s * kv;
                     }
-                }
-                3 => {
-                    for x in lo..hi {
-                        let base = (x - anchor) * 3;
-                        let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
-                        for (j, kv) in k.iter().enumerate() {
-                            let o = base + j * 3;
-                            r += srow[o] * *kv;
-                            g += srow[o + 1] * *kv;
-                            b += srow[o + 2] * *kv;
-                        }
-                        let d = x * 3;
-                        drow[d] = r;
-                        drow[d + 1] = g;
-                        drow[d + 2] = b;
-                    }
-                }
-                _ => {
-                    for x in lo..hi {
-                        let base = (x - anchor) * c;
-                        for ch in 0..c {
-                            let mut acc = 0.0f32;
-                            for (j, kv) in k.iter().enumerate() {
-                                acc += srow[base + j * c + ch] * *kv;
-                            }
-                            drow[x * c + ch] = acc;
-                        }
+                } else {
+                    for (d, s) in out.iter_mut().zip(taps) {
+                        *d += *s * kv;
                     }
                 }
             }
@@ -107,16 +102,53 @@ fn filter_cols(src: &Mat, k: &[f32], border: Border) -> Mat {
         .par_chunks_exact_mut(stride)
         .enumerate()
         .for_each(|(y, drow)| {
-            let taps = &table[y * ks..(y + 1) * ks];
-            drow.fill(0.0);
-            for (t, kv) in taps.iter().zip(k) {
-                if *t == usize::MAX {
-                    continue;
+            // Gather the contributing rows first and accumulate them in one
+            // pass. Adding each tap into the destination separately would read
+            // and rewrite the whole row once per tap. The gather stays on the
+            // stack so a wide kernel does not allocate once per output row.
+            let mut buffer: [(&[f32], f32); MAX_TAPS] = [(&[] as &[f32], 0.0f32); MAX_TAPS];
+            let mut n = 0usize;
+            for (t, kv) in table[y * ks..(y + 1) * ks].iter().zip(k) {
+                if *t != usize::MAX {
+                    buffer[n] = (&src.data[t * stride..(t + 1) * stride], *kv);
+                    n += 1;
                 }
-                let srow = &src.data[t * stride..(t + 1) * stride];
-                let kv = *kv;
-                for (d, s) in drow.iter_mut().zip(srow) {
-                    *d += *s * kv;
+            }
+            let rows = &buffer[..n];
+            if rows.is_empty() {
+                drow.fill(0.0);
+                return;
+            }
+
+            match rows.len() {
+                5 => {
+                    let (r0, w0) = rows[0];
+                    let (r1, w1) = rows[1];
+                    let (r2, w2) = rows[2];
+                    let (r3, w3) = rows[3];
+                    let (r4, w4) = rows[4];
+                    for (i, d) in drow.iter_mut().enumerate() {
+                        *d = r0[i] * w0 + r1[i] * w1 + r2[i] * w2 + r3[i] * w3 + r4[i] * w4;
+                    }
+                }
+                3 => {
+                    let (r0, w0) = rows[0];
+                    let (r1, w1) = rows[1];
+                    let (r2, w2) = rows[2];
+                    for (i, d) in drow.iter_mut().enumerate() {
+                        *d = r0[i] * w0 + r1[i] * w1 + r2[i] * w2;
+                    }
+                }
+                _ => {
+                    let (first, weight) = rows[0];
+                    for (d, s) in drow.iter_mut().zip(first) {
+                        *d = *s * weight;
+                    }
+                    for (srow, kv) in &rows[1..] {
+                        for (d, s) in drow.iter_mut().zip(*srow) {
+                            *d += *s * *kv;
+                        }
+                    }
                 }
             }
         });
