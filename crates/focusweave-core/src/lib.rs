@@ -34,6 +34,7 @@ pub mod focus;
 pub mod hooks;
 pub mod image_source;
 pub mod mat;
+pub mod memory;
 pub mod pyramid;
 pub mod resize;
 pub mod simd;

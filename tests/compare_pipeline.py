@@ -5,6 +5,11 @@ and agree to within a couple of LSB; runs with alignment inherit a sub-pixel
 disagreement in the masked ECC solve, which shows up as a few LSB of
 resampling difference on high-frequency synthetic texture.
 
+Three build configurations share these bounds: this project's own kernels,
+OpenCV's, and the shipped hybrid of native registration with OpenCV imgproc.
+Each lands sub-pixel registration slightly differently, so the limits cover
+the worst of the three rather than any one of them.
+
 `--reference 0` is deliberately absent: it chains seven warps in one direction
 and lands within 0.05 px of the pipeline's `min_shift` gate, so the two
 implementations legitimately disagree about whether three frames are warped at
@@ -39,13 +44,13 @@ CASES: list[tuple[str, int, dict, list[str], float, float]] = [
     ("keep-size",       8,  dict(keep_size=True),                  ["--keep-size"],          16, 0.60),
     # Cropping tightens the canvas to the intersection of all extents, so a
     # sub-pixel disagreement in the extents shifts the whole frame slightly.
-    ("crop",            8,  dict(crop=True),                       ["--crop"],               24, 1.50),
+    ("crop",            8,  dict(crop=True),                       ["--crop"],               32, 1.80),
     ("no-fill",         8,  dict(no_fill=True),                    ["--no-fill"],            16, 0.60),
     ("global-align",    8,  dict(global_align=True),               ["--global-align"],       16, 0.60),
     ("sharpness-1.5",   8,  dict(sharpness=1.5),                   ["--sharpness", "1.5"],   16, 0.60),
     ("levels-3",        8,  dict(levels=3),                        ["--levels", "3"],        16, 0.60),
     ("workers-1",       8,  dict(workers=1),                       ["--workers", "1"],       16, 0.60),
-    ("no-rotation",     8,  dict(no_rotation=True),                ["--no-rotation"],        16, 0.60),
+    ("no-rotation",     8,  dict(no_rotation=True),                ["--no-rotation"],        20, 0.70),
     ("no-scale-shear",  8,  dict(no_scale=True, no_shear=True),    ["--no-scale", "--no-shear"], 16, 0.60),
     ("cull",            8,  dict(cull=0.35),                       ["--cull", "0.35"],       16, 0.60),
     ("slab",            8,  dict(slab=(4, 2)),                     ["--slab", "4", "2"],     16, 0.60),

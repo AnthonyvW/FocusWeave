@@ -62,7 +62,7 @@ class StreamingFocusStacker:
         levels: int = 0,
         sharpness: float = 4.0,
         no_fill: bool = False,
-        workers: int = 3,
+        workers: int = 0,
         slab: tuple[int, int] | None = None,
         only_slab: bool = False,
         recursive_slab: bool = False,

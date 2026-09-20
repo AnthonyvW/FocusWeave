@@ -44,8 +44,10 @@ Stacking options
   --levels N              Laplacian pyramid levels (default: auto from image size).
   --sharpness EXPONENT    Weight sharpness exponent (default: 4.0). Useful range is
                           roughly 1.0 (soft blend) to 8.0 (near-hard selection).
-  --workers N             Number of parallel stacking workers (default: 3). Set to 0
-                          to use all CPU cores.
+  --workers N             Number of frames fused concurrently. The default picks
+                          one per core, capped so their buffers fit in free
+                          memory; pass a number to override it. Each worker costs
+                          roughly 110 MB per megapixel of output.
 
 Culling options
   --cull [THRESHOLD]      Remove wholly out-of-focus images before stacking. Frames

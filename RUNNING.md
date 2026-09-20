@@ -50,9 +50,9 @@ only in whose image-processing kernels run underneath.
 | | default | `--features opencv-backend` |
 | --- | --- | --- |
 | command | `cargo build --release -p focusweave-cli` | `cargo build --release -p focusweave-cli --features opencv-backend` |
-| needs | a Rust toolchain | OpenCV 4 development files, plus libclang |
-| speed | baseline | ~25% faster overall, ~3x on some kernels |
-| result | self-contained 3.5 MB binary | 2.7 MB binary plus ~16 MB of OpenCV shared libraries |
+| needs | a Rust toolchain | OpenCV 4 `core` and `imgproc`, plus libclang |
+| speed | baseline | ~1.4x faster overall, ~3x on some kernels |
+| result | self-contained 3.5 MB binary | 2.7 MB binary plus two OpenCV libraries, ~8 MB |
 | output | within a few LSB of the original | identical to the original without alignment, within a few LSB with it |
 
 **Build the OpenCV one if speed is what you care about.** The numbers are in
@@ -75,6 +75,11 @@ The `opencv` crate compiles against OpenCV's headers and links its libraries,
 and it uses libclang to generate the bindings. Both have to be installed
 before `cargo build` will work.
 
+Only `core` and `imgproc` are needed. Registration stays on this project's own
+ECC solver, which measures the same speed as OpenCV's; taking OpenCV's would
+mean linking `opencv_video`, and that drags in dnn, calib3d, features2d and
+flann for one function.
+
 **Linux (Debian, Ubuntu):**
 
     sudo apt-get install libopencv-dev libclang-dev
@@ -92,13 +97,15 @@ Chocolatey puts OpenCV in `C:\tools\opencv`. In the shell you build from
 
     $env:OPENCV_INCLUDE_PATHS = "C:\tools\opencv\build\include"
     $env:OPENCV_LINK_PATHS    = "C:\tools\opencv\build\x64\vc16\lib"
-    $env:OPENCV_LINK_LIBS     = "opencv_world4130"
+    $env:OPENCV_LINK_LIBS     = "opencv_world4130"   # or "opencv_core4130,opencv_imgproc4130"
     $env:LIBCLANG_PATH        = "C:\Program Files\LLVM\bin"
     cargo build --release -p focusweave-cli --features opencv-backend
 
 The resulting `focusweave.exe` needs OpenCV's DLLs at run time, so either add
-`C:\tools\opencv\build\x64\vc16\bin` to `PATH` or copy `opencv_world*.dll`
-next to the executable. vcpkg works too (`vcpkg install llvm opencv4`, with
+`C:\tools\opencv\build\x64\vc16\bin` to `PATH` or copy the DLLs next to the
+executable. Chocolatey ships the monolithic `opencv_world` build, which
+carries every module whether or not it is used; a modular OpenCV build lets
+you ship just `opencv_core` and `opencv_imgproc`. vcpkg works too (`vcpkg install llvm opencv4`, with
 `VCPKG_ROOT` set), and the crate then discovers everything by itself.
 
 **macOS:**
@@ -129,10 +136,12 @@ old Python CLI is accepted, with identical names and defaults:
 
 Three flags to know about while testing:
 
-- `--workers 0` uses every core. The default is still 3, inherited from the
-  Python implementation where it was a memory trade-off. On anything with more
-  than four cores it is leaving performance on the table — worth 15% here and
-  more on a bigger machine.
+- `--workers N` sets how many frames are fused at once. The default is
+  automatic: one per core, capped so the workers' buffers fit in free memory,
+  since each costs roughly 110 MB per megapixel of output. Coarse parallelism
+  over frames is what scales in the default build — much of fusing a frame is
+  per-pixel work no individual kernel parallelises — so this is the knob that
+  matters most. The line `Fusing (N workers)` reports what was chosen.
 - `--no-align` skips registration. Useful for isolating the fusion stage when
   comparing output against the old implementation.
 - `--timings` prints where the time went, and which kernels the binary was
@@ -314,35 +323,27 @@ have a known-good result for and compare. This is the check that matters; the
 synthetic tests only prove the port is faithful, not that you like the output.
 
 **Speed.** There are two builds. The default uses the kernels in this
-repository; `--features opencv-backend` routes every primitive to the OpenCV
-C++ library instead. On this machine (4 cores, 10 frames at 2000x1400, best of
-three):
+repository; `--features opencv-backend` routes the image processing to OpenCV.
+On this machine (4 cores, 25 frames at 2592x1944, best of three):
 
-| case                    | own kernels | OpenCV backend | Python + OpenCV |
-| ----------------------- | ----------- | -------------- | --------------- |
-| full run                | 3.68 s      | 2.74 s         | 2.96 s          |
-| fusion only (`--no-align`) | 1.61 s   | 1.32 s         | 1.63 s          |
-| full run, `--workers 0` | 2.99 s      | 2.37 s         | —               |
-| peak memory             | 1096 MiB    | 1168 MiB       | 1106 MiB        |
+| build           | total   |
+| --------------- | ------- |
+| own kernels     | 10.0 s  |
+| OpenCV backend  | 7.3 s   |
+| Python + OpenCV | 10.0 s  |
 
-Reproduce with `python tests/bench_all.py`, after building both binaries as
-that script's docstring describes.
+Reproduce with `python tests/bench_all.py target/bigstack`, after building
+both binaries as that script's docstring describes.
 
-The headline: linking OpenCV buys about 25% over the default build, but only
-about 8% over the Python it replaces. Most of a run is OpenCV either way in
-that configuration, and what Rust adds on top — no GIL, no marshalling — is
-worth less than the kernels themselves. The lever is the kernels, not the
-language.
-
-Per core, the kernels compare like this (`RAYON_NUM_THREADS=1 cargo run
---release -p focusweave-core --example bench_primitives`, and again with
-`--features opencv-backend`):
+The gap is entirely in stacking; alignment measures the same either way, which
+is why the OpenCV build only needs `imgproc`. Per core, the kernels compare
+like this (`RAYON_NUM_THREADS=1 cargo run --release -p focusweave-core
+--example bench_primitives`, and again with `--features opencv-backend`):
 
 | kernel                        | own kernels | OpenCV |
 | ----------------------------- | ----------- | ------ |
 | `sepFilter2D` 5-tap RGB f32   | 47 ms       | 23 ms  |
 | `sepFilter2D` 5-tap gray f32  | 16 ms       | 3 ms   |
-| `sqrBoxFilter` 3x3 gray       | 20 ms       | 7 ms   |
 | `GaussianBlur` 15 gray        | 22 ms       | 6 ms   |
 | `warpAffine` cubic RGB u8     | 231 ms      | 63 ms  |
 | `warpAffine` linear gray f32  | 56 ms       | 17 ms  |
@@ -350,20 +351,17 @@ Per core, the kernels compare like this (`RAYON_NUM_THREADS=1 cargo run
 | RGB to Lab                    | 7 ms        | 17 ms  |
 
 Lab is the one the default build wins, because it only computes the channel
-the fusion weights actually use rather than all three. Everything else is the
-SIMD gap: OpenCV dispatches hand-written AVX2 at runtime, while these loops
-are what the autovectoriser manages on its own. `warpAffine` is the worst of
-them and the one that still costs the default build a full run, because the
-ECC solver calls it four times per iteration; its per-pixel gather is the part
-that does not vectorise without explicit intrinsics.
+the fusion weights actually use. Everything else is the SIMD gap: OpenCV
+dispatches hand-written AVX2 at runtime, while these loops are what the
+autovectoriser manages on its own.
 
-Two things that mattered more than expected while getting here. Reshaping the
-separable filter so each tap is a contiguous slice took the 5-tap RGB case
-from 107 ms to 47 ms — loop shape, not instruction set. And switching the
-binary to an allocator that caches large blocks took a further 0.5 s off a
-full run, because the pipeline allocates and frees multi-megabyte scratch
-buffers on every pyramid level and glibc hands each one back to the kernel to
-be re-faulted.
+Three things mattered more than instruction set while getting here, and all
+three only showed up at scale. Fusing the separable filter's two passes, so
+the horizontally filtered intermediate never exists in full — the kernels are
+memory bound long before they are compute bound. Running the fusion workers on
+rayon's own pool rather than injecting from foreign threads. And sizing the
+worker pool to the machine: on twenty threads the old fixed default of three
+left stacking twice as slow as it needed to be.
 
 **Alignment on a hard stack.** Macro stacks with lots of out-of-focus area are
 where the ECC differences would show. Run with `--no-align` and without, on

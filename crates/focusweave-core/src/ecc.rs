@@ -241,19 +241,6 @@ pub fn find_transform_ecc(
     mask: Option<&MatU8>,
     gauss_filt_size: usize,
 ) -> Result<Affine, EccFailure> {
-    #[cfg(feature = "opencv-backend")]
-    return crate::backend_opencv::find_transform_ecc(
-        template,
-        input,
-        warp,
-        max_iterations,
-        termination_eps,
-        mask,
-        gauss_filt_size,
-    )
-    .ok_or(EccFailure("OpenCV ECC declined to converge"));
-
-    #[cfg(not(feature = "opencv-backend"))]
     find_transform_ecc_verbose(
         template,
         input,

@@ -102,7 +102,8 @@ impl Default for StackOptions {
             sharpness: 4.0,
             canvas_size: None,
             no_fill: false,
-            workers: 3,
+            // Zero is automatic; see resolve_workers.
+            workers: 0,
         }
     }
 }
@@ -143,15 +144,44 @@ fn accumulate(slot: &mut Option<Mat>, value: Option<Mat>) {
     }
 }
 
-fn resolve_workers(requested: usize, n: usize) -> usize {
-    let available = if requested > 0 {
-        requested
+/// Peak bytes a worker holds per canvas pixel while fusing one frame.
+///
+/// Measured, not derived: a worker carries its share of the accumulators plus
+/// the transient pyramids for the frame in flight. 16-bit sources keep a wider
+/// copy of the loaded frame on the way in.
+fn bytes_per_pixel_per_worker(depth: u32) -> u64 {
+    if depth == 16 {
+        160
     } else {
-        std::thread::available_parallelism()
-            .map(|v| v.get())
-            .unwrap_or(4)
-    };
-    available.min(n).max(1)
+        110
+    }
+}
+
+/// Decide how many frames to fuse concurrently.
+///
+/// Zero means automatic: every core, but capped so the workers' buffers fit in
+/// memory the machine actually has free. Coarse parallelism over frames is
+/// what scales here — much of fusing a frame is per-pixel work that no
+/// individual kernel parallelises — so the cap is the only thing standing
+/// between a wide machine and a large image set going to swap.
+fn resolve_workers(requested: usize, n: usize, canvas: (usize, usize), depth: u32) -> usize {
+    if requested > 0 {
+        return requested.min(n).max(1);
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(4);
+
+    let per_worker = bytes_per_pixel_per_worker(depth) * (canvas.0 as u64) * (canvas.1 as u64);
+    // Leave most of free memory alone: the caller may be holding the source
+    // frames, and going to swap costs far more than a missing worker saves.
+    const FALLBACK_BUDGET: u64 = 4 << 30;
+    let budget = crate::memory::available_bytes()
+        .map(|free| free / 2)
+        .unwrap_or(FALLBACK_BUDGET);
+    let by_memory = (budget / per_worker.max(1)).max(1) as usize;
+
+    cores.min(by_memory).min(n).max(1)
 }
 
 /// Fuse one frame's pyramid bands into a worker's running sums.
@@ -282,7 +312,7 @@ pub fn stack_images(
         Some(size) => size,
         None => source_size(&sources[0])?,
     };
-    let workers = resolve_workers(opts.workers, n);
+    let workers = resolve_workers(opts.workers, n, canvas, depth);
     let levels = opts.levels;
 
     hooks.report(

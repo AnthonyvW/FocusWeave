@@ -188,7 +188,7 @@ def stack_images(
     sharpness: float,
     canvas_size: tuple[int, int] | None = None,
     no_fill: bool = False,
-    workers: int = 3,
+    workers: int = 0,
     progress: ProgressCallback | None = None,
     interrupt: InterruptCallback | None = None,
 ) -> np.ndarray:
@@ -254,7 +254,8 @@ class FocusStackConfig:
     min_shift: float = 5.0
     levels: int = 0
     sharpness: float = 4.0
-    workers: int = 3
+    #: Frames fused concurrently; 0 picks one per core, capped to fit in memory.
+    workers: int = 0
     slab: tuple[int, int] | None = None
     only_slab: bool = False
     recursive_slab: bool = False

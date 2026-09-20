@@ -51,7 +51,7 @@ impl Default for StreamingConfig {
             levels: 0,
             sharpness: 4.0,
             no_fill: false,
-            workers: 3,
+            workers: 0,
             slab: None,
             only_slab: false,
             recursive_slab: false,

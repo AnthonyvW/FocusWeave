@@ -40,20 +40,25 @@ implementation; the feature swaps which one is called, and conversion in both
 directions borrows rather than copies, so the numbers reflect the kernels
 rather than marshalling.
 
-On 4 cores, 10 frames at 2000x1400, best of three:
+Only `imgproc` is routed to OpenCV. Registration stays on this crate's ECC
+solver and phase correlation, because they measure the same speed as OpenCV's:
+on 25 frames the alignment stage takes 2.4 s either way. Taking OpenCV's would
+mean linking `opencv_video` for one function, `findTransformECC`, and that
+drags in dnn, calib3d, features2d and flann — 6.7 MB of the 16 MB it would
+otherwise cost, for nothing. Trimmed to core and imgproc the dependency is two
+libraries and 8.2 MB.
 
-| case                       | own kernels | OpenCV backend | Python + OpenCV |
-| -------------------------- | ----------- | -------------- | --------------- |
-| full run                   | 3.68 s      | 2.74 s         | 2.96 s          |
-| fusion only                | 1.61 s      | 1.32 s         | 1.63 s          |
-| full run, all cores        | 2.99 s      | 2.37 s         | —               |
-| peak memory                | 1096 MiB    | 1168 MiB       | 1106 MiB        |
-| binary                     | 3.5 MB      | 2.7 MB + 16 MB of shared libraries | — |
+On 4 cores, 25 frames at 2592x1944, best of three:
 
-Linking OpenCV is worth about 25% over the default build and about 8% over the
-Python it replaces. That second number is the interesting one: in that
-configuration most of a run is OpenCV either way, and what Rust adds on top —
-no GIL, no marshalling — is worth less than the kernels themselves.
+| case          | own kernels | OpenCV backend | Python + OpenCV |
+| ------------- | ----------- | -------------- | --------------- |
+| full run      | 10.0 s      | 7.3 s          | 10.0 s          |
+| binary        | 3.5 MB      | 2.7 MB + 8.2 MB of shared libraries | — |
+
+The whole difference is in stacking. That is worth stating plainly: the
+rewrite bought portability and a single-file binary, and roughly parity with
+the Python it replaced; the further 1.4x costs a C++ dependency. Language was
+never the lever — kernels were.
 
 The cost is the thing the rewrite was for. The OpenCV build needs headers,
 libraries and libclang on every platform and links seven shared libraries

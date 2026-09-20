@@ -65,7 +65,8 @@ impl FocusStackConfig {
             min_shift: 5.0,
             levels: 0,
             sharpness: 4.0,
-            workers: 3,
+            // Zero is automatic: every core, capped to fit in memory.
+            workers: 0,
             slab: None,
             only_slab: false,
             recursive_slab: false,

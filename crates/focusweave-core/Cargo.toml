@@ -9,7 +9,7 @@ description = "Focus stacking via Laplacian pyramid fusion (core library)"
 
 [dependencies]
 image.workspace = true
-opencv = { version = "0.100", default-features = false, features = ["imgproc", "video"], optional = true }
+opencv = { version = "0.100", default-features = false, features = ["imgproc"], optional = true }
 rayon.workspace = true
 rustfft.workspace = true
 

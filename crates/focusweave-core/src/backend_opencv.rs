@@ -1,20 +1,22 @@
 //! Primitives routed to the OpenCV C++ library, behind the `opencv-backend`
 //! feature.
 //!
-//! This exists so the hand-written implementations in this crate can be timed
-//! against the library they replace, on identical inputs and with identical
-//! call sites. Conversion in both directions borrows rather than copies, so
-//! the measurements reflect OpenCV's kernels and not marshalling overhead.
+//! Only `imgproc` is routed here. Registration stays on this crate's own ECC
+//! solver and phase correlation: measured against OpenCV's they run at the
+//! same speed, and `opencv_video` exists solely to supply `findTransformECC`,
+//! which drags in dnn, calib3d, features2d and flann - 6.7 MB of the 16 MB
+//! this would otherwise link, for no gain.
+//!
+//! Conversion in both directions borrows rather than copies, so timings
+//! reflect OpenCV's kernels and not marshalling overhead.
 
 use crate::affine::Affine;
 use crate::border::Border;
 use crate::mat::{Mat, MatU16, MatU8};
 use crate::warp::Interp;
-use opencv::core::{
-    BorderTypes, Mat as CvMat, Point, Scalar, Size, TermCriteria, TermCriteria_Type,
-};
+use opencv::core::{BorderTypes, Mat as CvMat, Point, Scalar, Size};
+use opencv::imgproc;
 use opencv::prelude::*;
-use opencv::{imgproc, video};
 
 fn border_flag(border: Border) -> i32 {
     match border {
@@ -403,65 +405,4 @@ pub fn clahe(src: &MatU8, clip_limit: f64, tiles_x: usize, tiles_y: usize) -> Ma
     clahe.apply(&input, &mut dst).expect("CLAHE apply");
     drop(dst);
     out
-}
-
-pub fn phase_correlate(src1: &Mat, src2: &Mat) -> (f64, f64) {
-    as_cv!(flat_a, a, src1, f32);
-    as_cv!(flat_b, b, src2, f32);
-    let mut response = 0.0f64;
-    let shift =
-        imgproc::phase_correlate(&a, &b, &CvMat::default(), &mut response).expect("phaseCorrelate");
-    (shift.x, shift.y)
-}
-
-/// `cv::findTransformECC`, returning `None` where it declines to converge.
-#[allow(clippy::too_many_arguments)]
-pub fn find_transform_ecc(
-    template: &Mat,
-    input: &Mat,
-    warp: Affine,
-    max_iterations: usize,
-    termination_eps: f64,
-    mask: Option<&MatU8>,
-    gauss_filt_size: usize,
-) -> Option<Affine> {
-    as_cv!(flat_template, template_cv, template, f32);
-    as_cv!(flat_input, input_cv, input, f32);
-    let mut map = warp_matrix(&warp);
-    let criteria = TermCriteria::new(
-        TermCriteria_Type::COUNT as i32 | TermCriteria_Type::EPS as i32,
-        max_iterations as i32,
-        termination_eps,
-    )
-    .expect("term criteria");
-
-    let result = match mask {
-        Some(m) => {
-            as_cv!(flat_mask, mask_cv, m, u8);
-            video::find_transform_ecc(
-                &template_cv,
-                &input_cv,
-                &mut map,
-                video::MOTION_AFFINE,
-                criteria,
-                &mask_cv,
-                gauss_filt_size as i32,
-            )
-        }
-        None => video::find_transform_ecc(
-            &template_cv,
-            &input_cv,
-            &mut map,
-            video::MOTION_AFFINE,
-            criteria,
-            &CvMat::default(),
-            gauss_filt_size as i32,
-        ),
-    };
-    result.ok()?;
-
-    let values = map.data_typed::<f32>().expect("read warp");
-    Some(Affine([
-        values[0], values[1], values[2], values[3], values[4], values[5],
-    ]))
 }
