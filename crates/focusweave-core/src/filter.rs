@@ -29,98 +29,128 @@ fn sep_filter_native(src: &Mat, kx: &[f32], ky: &[f32], border: Border) -> Mat {
         kx.len() <= MAX_TAPS && ky.len() <= MAX_TAPS,
         "kernel longer than {MAX_TAPS} taps"
     );
-    let tmp = filter_rows(src, kx, border);
-    filter_cols(&tmp, ky, border)
-}
-
-fn filter_rows(src: &Mat, k: &[f32], border: Border) -> Mat {
     let (h, w, c) = (src.h, src.w, src.c);
-    let ks = k.len();
-    let anchor = ks / 2;
-    let mut dst = Mat::new(h, w, c);
-
-    // Columns in [lo, hi) have every tap inside the image, so they skip the
-    // border table entirely; only the two margins need index mapping.
-    let lo = anchor.min(w);
-    let hi = w.saturating_sub(ks - 1 - anchor).max(lo);
-    let table = border_table(w, ks, anchor, border);
-
     let stride = w * c;
-    dst.data
-        .par_chunks_exact_mut(stride)
-        .enumerate()
-        .for_each(|(y, drow)| {
-            let srow = &src.data[y * stride..(y + 1) * stride];
+    let (kxs, kys) = (kx.len(), ky.len());
+    let (x_anchor, y_anchor) = (kxs / 2, kys / 2);
+    let x_table = border_table(w, kxs, x_anchor, border);
+    let y_table = border_table(h, kys, y_anchor, border);
 
-            let margin = |x: usize, drow: &mut [f32]| {
-                let taps = &table[x * ks..(x + 1) * ks];
-                for ch in 0..c {
-                    let mut acc = 0.0f32;
-                    for (t, kv) in taps.iter().zip(k) {
-                        if *t != usize::MAX {
-                            acc += srow[t * c + ch] * *kv;
-                        }
+    // Columns in [lo, hi) have every horizontal tap inside the image, so they
+    // skip the border table; only the two margins need index mapping.
+    let lo = x_anchor.min(w);
+    let hi = w.saturating_sub(kxs - 1 - x_anchor).max(lo);
+
+    let mut dst = Mat::new(h, w, c);
+    if h == 0 || w == 0 {
+        return dst;
+    }
+
+    // The two passes are fused. Writing the horizontally filtered image out in
+    // full and reading it back costs two extra trips through main memory per
+    // filter, which is what dominates once several images are being fused at
+    // once — the kernels are memory bound long before they are compute bound.
+    // Instead each band of output rows keeps a ring of just `ky.len()`
+    // filtered rows, small enough to stay in cache, and the intermediate never
+    // exists in full.
+    let threads = rayon::current_num_threads().max(1);
+    let band = h.div_ceil(threads * 2).max(32).min(h);
+
+    dst.data
+        .par_chunks_mut(band * stride)
+        .enumerate()
+        .for_each(|(index, out)| {
+            let first_row = index * band;
+            let mut ring = vec![0.0f32; kys * stride];
+            // Which source row currently occupies each ring slot.
+            let mut resident = vec![usize::MAX; kys];
+
+            for (offset, drow) in out.chunks_exact_mut(stride).enumerate() {
+                let y = first_row + offset;
+                let taps = &y_table[y * kys..(y + 1) * kys];
+
+                // Fill any rows this output row needs that are not resident.
+                // Advancing by one output row normally brings in exactly one.
+                for source in taps.iter().copied() {
+                    if source == usize::MAX {
+                        continue;
                     }
-                    drow[x * c + ch] = acc;
+                    let slot = source % kys;
+                    if resident[slot] != source {
+                        let (from, to) = (slot * stride, (slot + 1) * stride);
+                        filter_row_into(
+                            &mut ring[from..to],
+                            &src.data[source * stride..(source + 1) * stride],
+                            kx,
+                            &x_table,
+                            lo,
+                            hi,
+                            x_anchor,
+                            c,
+                        );
+                        resident[slot] = source;
+                    }
                 }
-            };
-            for x in 0..lo {
-                margin(x, drow);
-            }
-            for x in hi..w {
-                margin(x, drow);
-            }
 
-            // Interior columns have every tap in range, so they need no border
-            // lookups. Tap `j` of output element `i` sits at `base[i + j * c]`
-            // whatever the channel count, so each tap is a contiguous slice of
-            // the source offset by `j * c` — an accumulate the autovectoriser
-            // turns into a plain multiply-add over whole vectors.
-            //
-            // An image narrower than the anchor has no interior at all; the
-            // margins above have already covered every column.
-            if hi <= lo || lo < anchor {
-                return;
-            }
-            let out = &mut drow[lo * c..hi * c];
-            let base = &srow[(lo - anchor) * c..];
-            crate::simd::row_taps(out, base, k, c);
-        });
-    dst
-}
-
-fn filter_cols(src: &Mat, k: &[f32], border: Border) -> Mat {
-    let (h, w, c) = (src.h, src.w, src.c);
-    let anchor = k.len() / 2;
-    let table = border_table(h, k.len(), anchor, border);
-    let ks = k.len();
-    let stride = w * c;
-    let mut dst = Mat::new(h, w, c);
-    dst.data
-        .par_chunks_exact_mut(stride)
-        .enumerate()
-        .for_each(|(y, drow)| {
-            // Gather the contributing rows first and accumulate them in one
-            // pass. Adding each tap into the destination separately would read
-            // and rewrite the whole row once per tap. The gather stays on the
-            // stack so a wide kernel does not allocate once per output row.
-            let mut buffer: [(&[f32], f32); MAX_TAPS] = [(&[] as &[f32], 0.0f32); MAX_TAPS];
-            let mut n = 0usize;
-            for (t, kv) in table[y * ks..(y + 1) * ks].iter().zip(k) {
-                if *t != usize::MAX {
-                    buffer[n] = (&src.data[t * stride..(t + 1) * stride], *kv);
+                let mut rows: [(&[f32], f32); MAX_TAPS] = [(&[] as &[f32], 0.0f32); MAX_TAPS];
+                let mut n = 0usize;
+                for (j, source) in taps.iter().copied().enumerate() {
+                    if source == usize::MAX {
+                        continue;
+                    }
+                    let slot = source % kys;
+                    rows[n] = (&ring[slot * stride..(slot + 1) * stride], ky[j]);
                     n += 1;
                 }
+                if n == 0 {
+                    drow.fill(0.0);
+                } else {
+                    crate::simd::col_taps(drow, &rows[..n]);
+                }
             }
-            let rows = &buffer[..n];
-            if rows.is_empty() {
-                drow.fill(0.0);
-                return;
-            }
-
-            crate::simd::col_taps(drow, rows);
         });
     dst
+}
+
+/// Horizontal pass for a single row.
+#[allow(clippy::too_many_arguments)]
+fn filter_row_into(
+    out: &mut [f32],
+    srow: &[f32],
+    k: &[f32],
+    x_table: &[usize],
+    lo: usize,
+    hi: usize,
+    anchor: usize,
+    c: usize,
+) {
+    let ks = k.len();
+    let w = out.len() / c;
+    let margin = |x: usize, out: &mut [f32]| {
+        let taps = &x_table[x * ks..(x + 1) * ks];
+        for ch in 0..c {
+            let mut acc = 0.0f32;
+            for (t, kv) in taps.iter().zip(k) {
+                if *t != usize::MAX {
+                    acc += srow[t * c + ch] * *kv;
+                }
+            }
+            out[x * c + ch] = acc;
+        }
+    };
+    for x in 0..lo {
+        margin(x, out);
+    }
+    for x in hi..w {
+        margin(x, out);
+    }
+
+    // An image narrower than the anchor has no interior; the margins above
+    // have already covered every column.
+    if hi <= lo || lo < anchor {
+        return;
+    }
+    crate::simd::row_taps(&mut out[lo * c..hi * c], &srow[(lo - anchor) * c..], k, c);
 }
 
 /// Non-separable correlation, equivalent to `cv2.filter2D` with `CV_32F` output.

@@ -301,12 +301,17 @@ pub fn stack_images(
     let done = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel::<Result<(usize, Partial), Error>>();
 
-    std::thread::scope(|scope| {
+    // Rayon tasks rather than OS threads. The filters these call parallelise
+    // internally, and rayon composes nested parallelism from inside its own
+    // pool; injecting it from foreign threads instead makes every inner
+    // parallel_for a cross-thread handshake, which costs more the more cores
+    // the machine has.
+    rayon::in_place_scope(|scope| {
         for (start, end) in batches.iter().copied() {
             let tx = tx.clone();
             let cancelled = &cancelled;
             let done = &done;
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 let mut partial = Partial::new(levels);
                 for i in start..end {
                     if cancelled.load(Ordering::Relaxed) {

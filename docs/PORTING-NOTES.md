@@ -178,6 +178,20 @@ knowing about before optimising further:
   contiguous runs, so "is any pixel in this window set" is a constant-time
   query rather than a scan of the neighbourhood.
 
+- **The separable filter's two passes are fused.** Writing the horizontally
+  filtered image out in full and reading it back adds two trips through main
+  memory per filter, and the kernels are memory bound long before they are
+  compute bound — coarse parallelism over frames stopped scaling past two
+  workers because of it. Each band of output rows now keeps a ring of just
+  `ky.len()` filtered rows, small enough to stay in cache, and the
+  intermediate never exists in full. This also made the rayon work items
+  whole bands rather than single rows, which matters much more the more cores
+  the machine has.
+- **The fusion workers are rayon tasks, not OS threads.** The filters they
+  call parallelise internally, and rayon composes nested parallelism from
+  inside its own pool; injecting it from foreign threads instead turns every
+  inner `parallel_for` into a cross-thread handshake. `in_place_scope` is what
+  allows this while the non-`Send` progress hooks stay on the calling thread.
 - **Large scratch buffers go through an allocator that caches them.** The
   pipeline allocates and frees multi-megabyte buffers on every pyramid level.
   glibc services those with `mmap` and returns each one to the kernel
@@ -185,8 +199,11 @@ knowing about before optimising further:
   the binary and the extension module to mimalloc took half a second off a
   full run — more than the SIMD work did.
 
-Two findings worth carrying forward. Loop shape mattered far more than
-instruction set: reshaping the separable filter so each tap is a contiguous
+Two findings worth carrying forward. Memory traffic and scheduling shape
+mattered far more than instruction set — and both only showed up at scale. A
+ten-frame benchmark on four cores hid them entirely; twenty-five frames on
+twenty threads made stacking *slower* than the same work on four. Loop shape
+came next: reshaping the separable filter so each tap is a contiguous
 slice took the 5-tap RGB case from 107 ms to 47 ms per core, while enabling
 AVX2 on top of that was worth only a few percent, because the multi-pass form
 it replaced was bandwidth bound rather than compute bound. And the remaining
