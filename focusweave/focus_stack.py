@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -10,11 +11,36 @@ from typing import Literal
 import cv2
 import numpy as np
 
+# We already parallelize across images at the Python thread level below; leaving
+# OpenCV's own internal thread pool enabled would let each worker thread further
+# fan out across all cores, oversubscribing the machine and starving other threads
+# (including a host program's) of the GIL when multiple stacks run concurrently.
+cv2.setNumThreads(1)
+
 
 _K1D = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16.0
 _K1D_X2 = _K1D * 2
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
+
+# Shared across all calls in the process so N concurrent stacks/alignments share a
+# single bounded pool of OS threads (cpu_count) instead of each spawning their own,
+# which is what let concurrent FocusWeave instances multiply thread count and lock
+# up the GIL for the rest of the host process.
+_shared_pool_lock = threading.Lock()
+_shared_pool: ThreadPoolExecutor | None = None
+
+
+def _get_shared_pool() -> ThreadPoolExecutor:
+    global _shared_pool
+    if _shared_pool is None:
+        with _shared_pool_lock:
+            if _shared_pool is None:
+                _shared_pool = ThreadPoolExecutor(
+                    max_workers=os.cpu_count() or 4,
+                    thread_name_prefix="focusweave",
+                )
+    return _shared_pool
 
 
 Stage = Literal["loading", "culling", "aligning", "stacking", "slabbing", "complete"]
@@ -624,9 +650,8 @@ def align_images(
             grays[i] = _load_raw_gray(images[i])
         prepared[i][fine_res] = _prepare_for_ecc(grays[i], fine_res)
 
-    n_prep_workers = min(n, workers if workers > 0 else (os.cpu_count() or 4))
-    with ThreadPoolExecutor(max_workers=n_prep_workers) as pool:
-        list(pool.map(_preload_and_prepare, range(n)))
+    pool = _get_shared_pool()
+    list(pool.map(_preload_and_prepare, range(n)))
 
     def _run(ref_idx: int, ref: np.ndarray, src_idx: int, src: np.ndarray) -> tuple[np.ndarray, bool]:
         return _run_ecc(ref, src, full_res,
@@ -965,9 +990,11 @@ def stack_images(
     no_fill uses BORDER_CONSTANT (black) instead of BORDER_REFLECT for regions
     outside each image's coverage after warping.
 
-    workers controls how many images are processed concurrently. Peak RAM scales
-    with workers × ~100 MiB per image plus the fixed fused_lp accumulator.
-    Default of 3 workers balances speed and memory for most systems.
+    workers controls how many batches this call splits its images into (and thus
+    peak RAM: it scales with workers × ~100 MiB per image plus the fixed fused_lp
+    accumulator). Default of 3 balances speed and memory for most systems. Actual
+    concurrent execution is capped process-wide at cpu_count() via a shared thread
+    pool, so multiple concurrent calls share threads rather than multiplying them.
 
     progress is called as progress(fraction, stage, message) after each image is fused
     and at each subsequent stage. fraction runs from 0 to 1 across the full
@@ -1179,25 +1206,27 @@ def stack_images(
 
     done_count = 0
 
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_process_batch, batch): batch for batch in batches}
-        for future in as_completed(futures):
-            partial_energy, partial_fused, partial_unweighted, partial_count = future.result()
+    pool = _get_shared_pool()
+    futures = {pool.submit(_process_batch, batch): batch for batch in batches}
+    for future in as_completed(futures):
+        partial_energy, partial_fused, partial_unweighted, partial_count = future.result()
 
-            for i in range(levels + 1):
-                energy_sums[i] = (partial_energy[i] if energy_sums[i] is None
-                                  else energy_sums[i] + partial_energy[i])  # type: ignore[operator]
-                fused[i] = (partial_fused[i] if fused[i] is None
-                            else fused[i] + partial_fused[i])  # type: ignore[operator]
-                unweighted[i] = (partial_unweighted[i] if unweighted[i] is None
-                                 else unweighted[i] + partial_unweighted[i])  # type: ignore[operator]
+        for i in range(levels + 1):
+            energy_sums[i] = (partial_energy[i] if energy_sums[i] is None
+                              else energy_sums[i] + partial_energy[i])  # type: ignore[operator]
+            fused[i] = (partial_fused[i] if fused[i] is None
+                        else fused[i] + partial_fused[i])  # type: ignore[operator]
+            unweighted[i] = (partial_unweighted[i] if unweighted[i] is None
+                             else unweighted[i] + partial_unweighted[i])  # type: ignore[operator]
 
-            total_count += partial_count
-            done_count += len(futures[future])
-            if progress is not None:
-                progress(done_count / n * 0.7, "stacking", f"Fused image {done_count}/{n}")
-            if interrupt is not None and interrupt():
-                raise Interrupted
+        total_count += partial_count
+        done_count += len(futures[future])
+        if progress is not None:
+            progress(done_count / n * 0.7, "stacking", f"Fused image {done_count}/{n}")
+        if interrupt is not None and interrupt():
+            for pending in futures:
+                pending.cancel()
+            raise Interrupted
 
     for i in range(levels + 1):
         e = energy_sums[i]  # type: ignore[index]
