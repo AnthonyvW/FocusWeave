@@ -185,7 +185,9 @@ jobs:
         run: |
           python -m venv "$HOME/clean"
           if [ "$RUNNER_OS" = "Windows" ]; then bin="$HOME/clean/Scripts"; exe=".exe"; else bin="$HOME/clean/bin"; exe=""; fi
-          "$bin/pip" install pillow
+          "$bin/pip" install numpy pillow
+          # --no-index so the wheel under test is the one installed, never a
+          # release from PyPI; its dependencies are already in place above.
           "$bin/pip" install --no-index --find-links dist focusweave
           "$bin/python" ci/make_smoke_stack.py smoke-frames
           "$bin/python" -c "
