@@ -103,11 +103,8 @@ jobs:
       - name: Bundle (macOS)
         if: runner.os == 'macOS'
         run: |
-          mkdir -p "${{ matrix.archive }}"
-          cp target/release/focusweave "${{ matrix.archive }}/"
-          # -a to keep the symlinks: each library installs as one real file and
-          # two links, and a dereferencing copy would triple the folder.
-          cp -a "${{ steps.opencv.outputs.lib-dir }}"/libopencv_*.dylib "${{ matrix.archive }}/"
+          python ci/bundle_macho.py target/release/focusweave "${{ matrix.archive }}" \
+            --search "${{ steps.opencv.outputs.lib-dir }}"
 
       - name: Bundle (Windows)
         if: runner.os == 'Windows'
