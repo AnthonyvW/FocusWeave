@@ -328,6 +328,55 @@ fn warp_flags(interp: Interp, inverse_map: bool) -> i32 {
     flags
 }
 
+/// `warpAffine` gained a trailing `AlgorithmHint` in OpenCV 5. The `_def`
+/// wrapper cannot stand in for it, because that form also defaults the
+/// interpolation flags and border mode this crate relies on, so the two
+/// signatures are written out separately and selected by build.rs.
+#[cfg(opencv_algorithm_hint)]
+fn warp_into(
+    src: &impl opencv::core::ToInputArray,
+    dst: &mut impl opencv::core::ToOutputArray,
+    m: &Affine,
+    dst_w: usize,
+    dst_h: usize,
+    flags: i32,
+    border: Border,
+) {
+    imgproc::warp_affine(
+        src,
+        dst,
+        &warp_matrix(m),
+        Size::new(dst_w as i32, dst_h as i32),
+        flags,
+        border_flag(border),
+        Scalar::all(0.0),
+        opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )
+    .expect("warpAffine");
+}
+
+#[cfg(not(opencv_algorithm_hint))]
+fn warp_into(
+    src: &impl opencv::core::ToInputArray,
+    dst: &mut impl opencv::core::ToOutputArray,
+    m: &Affine,
+    dst_w: usize,
+    dst_h: usize,
+    flags: i32,
+    border: Border,
+) {
+    imgproc::warp_affine(
+        src,
+        dst,
+        &warp_matrix(m),
+        Size::new(dst_w as i32, dst_h as i32),
+        flags,
+        border_flag(border),
+        Scalar::all(0.0),
+    )
+    .expect("warpAffine");
+}
+
 pub fn warp_affine(
     src: &Mat,
     m: &Affine,
@@ -340,16 +389,15 @@ pub fn warp_affine(
     as_cv!(flat_input, input, src, f32);
     let mut out = Mat::new(dst_h, dst_w, src.c);
     out_cv!(flat_out, dst, &mut out, f32);
-    imgproc::warp_affine(
+    warp_into(
         &input,
         &mut dst,
-        &warp_matrix(m),
-        Size::new(dst_w as i32, dst_h as i32),
+        m,
+        dst_w,
+        dst_h,
         warp_flags(interp, inverse_map),
-        border_flag(border),
-        Scalar::all(0.0),
-    )
-    .expect("warpAffine");
+        border,
+    );
     drop(dst);
     out
 }
@@ -365,16 +413,15 @@ pub fn warp_affine_u8(
     as_cv!(flat_input, input, src, u8);
     let mut out = MatU8::new(dst_h, dst_w, src.c);
     out_cv!(flat_out, dst, &mut out, u8);
-    imgproc::warp_affine(
+    warp_into(
         &input,
         &mut dst,
-        &warp_matrix(m),
-        Size::new(dst_w as i32, dst_h as i32),
+        m,
+        dst_w,
+        dst_h,
         warp_flags(interp, false),
-        border_flag(border),
-        Scalar::all(0.0),
-    )
-    .expect("warpAffine");
+        border,
+    );
     drop(dst);
     out
 }
@@ -390,16 +437,15 @@ pub fn warp_affine_u16(
     as_cv!(flat_input, input, src, u16);
     let mut out = MatU16::new(dst_h, dst_w, src.c);
     out_cv!(flat_out, dst, &mut out, u16);
-    imgproc::warp_affine(
+    warp_into(
         &input,
         &mut dst,
-        &warp_matrix(m),
-        Size::new(dst_w as i32, dst_h as i32),
+        m,
+        dst_w,
+        dst_h,
         warp_flags(interp, false),
-        border_flag(border),
-        Scalar::all(0.0),
-    )
-    .expect("warpAffine");
+        border,
+    );
     drop(dst);
     out
 }
