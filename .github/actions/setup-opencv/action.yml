@@ -26,14 +26,27 @@ runs:
       run: |
         brew install opencv llvm
         prefix="$(brew --prefix opencv)"
-        # Naming core and imgproc explicitly rather than letting pkg-config
-        # hand over every module: macOS links without --as-needed, so the
-        # pkg-config list would drag all of OpenCV into the artifact.
-        echo "OPENCV_INCLUDE_PATHS=$prefix/include/opencv4" >> "$GITHUB_ENV"
-        echo "OPENCV_LINK_PATHS=$prefix/lib"                >> "$GITHUB_ENV"
-        echo "OPENCV_LINK_LIBS=opencv_core,opencv_imgproc"  >> "$GITHUB_ENV"
-        echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"      >> "$GITHUB_ENV"
-        echo "FOCUSWEAVE_OPENCV_LIB_DIR=$prefix/lib"        >> "$GITHUB_ENV"
+
+        # Homebrew's major version moves, and with it the name of the include
+        # directory, so find the one holding opencv2/ rather than naming it.
+        # A wrong OPENCV_INCLUDE_PATHS is worse than none: it poisons the
+        # cmake and pkg-config probes too, and the build fails having found
+        # nothing.
+        opencv2="$(find "$prefix/include" -maxdepth 2 -type d -name opencv2 | head -1)"
+        if [ -z "$opencv2" ]; then
+          echo "no opencv2 include directory under $prefix/include" >&2
+          find "$prefix/include" -maxdepth 2 >&2
+          exit 1
+        fi
+
+        # Naming core and imgproc explicitly rather than letting the probes
+        # hand over every module: macOS links without --as-needed, so the full
+        # list would drag all of OpenCV into the artifact.
+        echo "OPENCV_INCLUDE_PATHS=$(dirname "$opencv2")" >> "$GITHUB_ENV"
+        echo "OPENCV_LINK_PATHS=$prefix/lib"               >> "$GITHUB_ENV"
+        echo "OPENCV_LINK_LIBS=opencv_core,opencv_imgproc" >> "$GITHUB_ENV"
+        echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"     >> "$GITHUB_ENV"
+        echo "FOCUSWEAVE_OPENCV_LIB_DIR=$prefix/lib"       >> "$GITHUB_ENV"
 
     - name: Windows
       if: runner.os == 'Windows'
