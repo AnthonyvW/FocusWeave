@@ -126,12 +126,17 @@ jobs:
           Copy-Item target\release\focusweave.exe "${{ matrix.archive }}\"
           Copy-Item "${{ steps.opencv.outputs.lib-dir }}\opencv_*.dll" "${{ matrix.archive }}\"
 
-      # Run the bundle from a directory the build environment does not reach
-      # into, so a missing library fails here rather than for whoever downloads
-      # it. pillow writes the test frames; nothing here provides OpenCV.
+      # The OpenCV install is moved out of the way first, and the bundle run
+      # from a directory the build never touched. Without that, the rpath
+      # pointing at the build machine's OpenCV resolves and the test passes on
+      # an archive containing no libraries at all -- which is exactly what it
+      # did before this step hid it. pillow writes the frames; nothing here
+      # provides OpenCV.
       - name: Smoke test
         shell: bash
         run: |
+          trap 'mv "$HOME/opencv-hidden" "$HOME/opencv-min" 2>/dev/null || true' EXIT
+          mv "$HOME/opencv-min" "$HOME/opencv-hidden"
           [ "$RUNNER_OS" = "Windows" ] && exe=".exe" || exe=""
           pip install numpy pillow
           python ci/make_smoke_stack.py smoke-frames
@@ -199,8 +204,16 @@ jobs:
       # tagged for the runner's glibc rather than being broadly portable.
       - run: maturin build --release --out dist
 
-      # maturin repairs the Linux and macOS wheels itself. Windows has no
-      # equivalent, so the DLLs are copied in by delvewheel.
+      # maturin repairs the Linux wheel itself. It leaves the macOS one alone
+      # -- it produced a 1.3 MB wheel with no dylibs in it -- so delocate does
+      # that, and delvewheel the Windows DLLs.
+      - name: Repair (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pip install delocate
+          delocate-wheel -w repaired -v dist/*.whl
+          rm -rf dist && mv repaired dist
+
       - name: Repair (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -209,11 +222,15 @@ jobs:
           delvewheel repair --add-path "${{ steps.opencv.outputs.lib-dir }}" -w repaired dist/*.whl
           rm -rf dist && mv repaired dist
 
-      # A venv the build environment has not touched: if a library is missing
-      # from the wheel, the import fails here.
+      # The OpenCV install is moved out of the way first, so the only copy of
+      # it left is whatever the wheel carries. Without that the extension's
+      # rpath finds the build machine's copy and the test passes on a wheel
+      # that would not import anywhere else.
       - name: Smoke test
         shell: bash
         run: |
+          trap 'mv "$HOME/opencv-hidden" "$HOME/opencv-min" 2>/dev/null || true' EXIT
+          mv "$HOME/opencv-min" "$HOME/opencv-hidden"
           python -m venv "$HOME/clean"
           if [ "$RUNNER_OS" = "Windows" ]; then bin="$HOME/clean/Scripts"; exe=".exe"; else bin="$HOME/clean/bin"; exe=""; fi
           "$bin/pip" install numpy pillow
