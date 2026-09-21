@@ -8,21 +8,49 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  OPENCV_VERSION: "4.10.0"
+
 jobs:
+  # Populates the OpenCV cache once per platform so the six jobs below restore
+  # it rather than each building their own copy.
+  opencv:
+    name: OpenCV (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/setup-opencv
+        with:
+          version: ${{ env.OPENCV_VERSION }}
+
   check:
+    needs: opencv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
       - uses: ./.github/actions/setup-opencv
+        with:
+          version: ${{ env.OPENCV_VERSION }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
   compare:
     name: Compare against the reference implementation
+    needs: opencv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -31,6 +59,8 @@ jobs:
         with:
           python-version: "3.12"
       - uses: ./.github/actions/setup-opencv
+        with:
+          version: ${{ env.OPENCV_VERSION }}
       - run: pip install -r tests/requirements.txt maturin
       - run: cargo build --release -p focusweave-cli
       - run: maturin build --release --out dist
@@ -39,6 +69,7 @@ jobs:
 
   binaries:
     name: Binary (${{ matrix.os }})
+    needs: opencv
     strategy:
       fail-fast: false
       matrix:
@@ -60,29 +91,27 @@ jobs:
           python-version: "3.12"
       - uses: ./.github/actions/setup-opencv
         id: opencv
+        with:
+          version: ${{ env.OPENCV_VERSION }}
 
       - run: cargo build --release -p focusweave-cli
 
       # OpenCV is linked dynamically, so a bare executable will not start on a
-      # machine that does not already have it. Each archive carries the
-      # libraries next to the binary, with the loader pointed at that directory.
+      # machine without it. Each archive carries the two libraries beside the
+      # binary; it is only two because the OpenCV built above has no LAPACK,
+      # OpenBLAS or GL behind it.
       - name: Bundle (Linux)
         if: runner.os == 'Linux'
-        run: python ci/bundle_elf.py target/release/focusweave "${{ matrix.archive }}"
+        run: |
+          python ci/bundle_elf.py target/release/focusweave "${{ matrix.archive }}" \
+            --search "${{ steps.opencv.outputs.lib-dir }}"
 
       - name: Bundle (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install dylibbundler
           mkdir -p "${{ matrix.archive }}"
           cp target/release/focusweave "${{ matrix.archive }}/"
-          dylibbundler --overwrite-files --bundle-deps --create-dir \
-            --fix-file "${{ matrix.archive }}/focusweave" \
-            --dest-dir "${{ matrix.archive }}/libs" \
-            --install-path "@executable_path/libs"
-          # Rewriting load commands invalidates the code signature, and arm64
-          # macOS refuses to start a binary whose signature does not match.
-          find "${{ matrix.archive }}" -type f -exec codesign --force --sign - {} \; 2>/dev/null || true
+          cp "${{ steps.opencv.outputs.lib-dir }}"/libopencv_*.dylib "${{ matrix.archive }}/"
 
       - name: Bundle (Windows)
         if: runner.os == 'Windows'
@@ -90,11 +119,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "${{ matrix.archive }}" | Out-Null
           Copy-Item target\release\focusweave.exe "${{ matrix.archive }}\"
-          Copy-Item "${{ steps.opencv.outputs.lib-dir }}\opencv_world*.dll" "${{ matrix.archive }}\"
+          Copy-Item "${{ steps.opencv.outputs.lib-dir }}\opencv_*.dll" "${{ matrix.archive }}\"
 
       # Run the bundle from a directory the build environment does not reach
       # into, so a missing library fails here rather than for whoever downloads
-      # it. pillow writes the test frames; nothing in this step provides OpenCV.
+      # it. pillow writes the test frames; nothing here provides OpenCV.
       - name: Smoke test
         shell: bash
         run: |
@@ -110,6 +139,7 @@ jobs:
           print('stacked', im.size, im.mode)
           "
           mv "$HOME/bundle-under-test" "${{ matrix.archive }}"
+          du -sh "${{ matrix.archive }}"
 
       - name: Archive
         shell: bash
@@ -138,6 +168,7 @@ jobs:
 
   wheels:
     name: Wheel (${{ matrix.os }})
+    needs: opencv
     strategy:
       fail-fast: false
       matrix:
@@ -153,6 +184,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-opencv
         id: opencv
+        with:
+          version: ${{ env.OPENCV_VERSION }}
 
       - run: pip install maturin
 
@@ -160,22 +193,14 @@ jobs:
       # tagged for the runner's glibc rather than being broadly portable.
       - run: maturin build --release --out dist
 
-      # maturin repairs Linux wheels itself. The other two need their OpenCV
-      # copied in by hand, or the wheel imports only on a machine that already
-      # has the library the build linked against.
+      # maturin repairs the Linux and macOS wheels itself. Windows has no
+      # equivalent, so the DLLs are copied in by delvewheel.
       - name: Repair (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           pip install delvewheel
           delvewheel repair --add-path "${{ steps.opencv.outputs.lib-dir }}" -w repaired dist/*.whl
-          rm -rf dist && mv repaired dist
-
-      - name: Repair (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          pip install delocate
-          delocate-wheel -w repaired -v dist/*.whl
           rm -rf dist && mv repaired dist
 
       # A venv the build environment has not touched: if a library is missing
@@ -192,13 +217,12 @@ jobs:
           "$bin/python" ci/make_smoke_stack.py smoke-frames
           "$bin/python" -c "
           from pathlib import Path
-          import focusweave
           from focusweave import FocusStackConfig, run
           result = run(FocusStackConfig(images=Path('smoke-frames')))
           print('api ok', result.image.shape, result.image.dtype)
           "
           "$bin/focusweave$exe" smoke-frames --output cli.png
-          ls -l dist cli.png
+          ls -l dist
 
       - uses: actions/upload-artifact@v6
         with:

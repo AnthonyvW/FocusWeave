@@ -1,8 +1,13 @@
 name: Set up OpenCV
 description: >
-  Install OpenCV 4 and libclang, then export everything the opencv crate needs
-  to find them. Outputs the directory holding the runtime libraries, for the
-  steps that bundle them into an artifact.
+  Make a minimal OpenCV available and export everything the opencv crate needs
+  to find it, building it on a cache miss. Outputs the directory holding the
+  runtime libraries, for the steps that bundle them into an artifact.
+
+inputs:
+  version:
+    description: OpenCV version to build
+    default: "4.10.0"
 
 outputs:
   lib-dir:
@@ -12,43 +17,19 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Linux
+    - name: Install libclang (Linux)
       if: runner.os == 'Linux'
       shell: bash
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libopencv-dev libclang-dev patchelf
-        echo "FOCUSWEAVE_OPENCV_LIB_DIR=$(pkg-config --variable=libdir opencv4)" >> "$GITHUB_ENV"
+      run: sudo apt-get update && sudo apt-get install -y libclang-dev patchelf
 
-    - name: macOS
+    - name: Install libclang (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew install opencv llvm
-        prefix="$(brew --prefix opencv)"
+        brew install llvm
+        echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
 
-        # Homebrew's major version moves, and with it the name of the include
-        # directory, so find the one holding opencv2/ rather than naming it.
-        # A wrong OPENCV_INCLUDE_PATHS is worse than none: it poisons the
-        # cmake and pkg-config probes too, and the build fails having found
-        # nothing.
-        opencv2="$(find "$prefix/include" -maxdepth 2 -type d -name opencv2 | head -1)"
-        if [ -z "$opencv2" ]; then
-          echo "no opencv2 include directory under $prefix/include" >&2
-          find "$prefix/include" -maxdepth 2 >&2
-          exit 1
-        fi
-
-        # Naming core and imgproc explicitly rather than letting the probes
-        # hand over every module: macOS links without --as-needed, so the full
-        # list would drag all of OpenCV into the artifact.
-        echo "OPENCV_INCLUDE_PATHS=$(dirname "$opencv2")" >> "$GITHUB_ENV"
-        echo "OPENCV_LINK_PATHS=$prefix/lib"               >> "$GITHUB_ENV"
-        echo "OPENCV_LINK_LIBS=opencv_core,opencv_imgproc" >> "$GITHUB_ENV"
-        echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"     >> "$GITHUB_ENV"
-        echo "FOCUSWEAVE_OPENCV_LIB_DIR=$prefix/lib"       >> "$GITHUB_ENV"
-
-    - name: Windows
+    - name: Install libclang (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
@@ -57,19 +38,17 @@ runs:
         if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
           choco install --no-progress -y llvm
         }
-        choco install --no-progress -y opencv --version=4.10.0
+        "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
-        $lib = Get-ChildItem -Path C:\tools\opencv\build -Recurse -Filter "opencv_world*.lib" |
-               Select-Object -First 1
-        if (-not $lib) { throw "no opencv_world*.lib under C:\tools\opencv\build" }
-        $linkPath = $lib.Directory.FullName
-        $binPath  = Join-Path (Split-Path $linkPath -Parent) "bin"
+    - name: Cache OpenCV
+      uses: actions/cache@v4
+      with:
+        path: ~/opencv-min
+        key: opencv-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/build_opencv.py') }}
 
-        "OPENCV_INCLUDE_PATHS=C:\tools\opencv\build\include" >> $env:GITHUB_ENV
-        "OPENCV_LINK_PATHS=$linkPath"                        >> $env:GITHUB_ENV
-        "OPENCV_LINK_LIBS=$($lib.BaseName)"                  >> $env:GITHUB_ENV
-        "LIBCLANG_PATH=C:\Program Files\LLVM\bin"            >> $env:GITHUB_ENV
-        "FOCUSWEAVE_OPENCV_LIB_DIR=$binPath"                 >> $env:GITHUB_ENV
+    - name: Build OpenCV if the cache missed, and export where it is
+      shell: bash
+      run: python ci/build_opencv.py --version "${{ inputs.version }}" --prefix ~/opencv-min --env-file "$GITHUB_ENV"
 
     - name: Report
       id: report
@@ -77,3 +56,18 @@ runs:
       run: |
         echo "lib-dir=$FOCUSWEAVE_OPENCV_LIB_DIR" >> "$GITHUB_OUTPUT"
         echo "OpenCV runtime libraries: $FOCUSWEAVE_OPENCV_LIB_DIR"
+
+        # The libraries are not on any system path, so what is built here has
+        # to carry the way to find them. @executable_path and @loader_path
+        # keep working once the libraries are copied next to the artifact;
+        # bundle_elf.py replaces the Linux rpath with $ORIGIN for the same
+        # reason. Windows needs none of this: it searches the directory the
+        # executable is in.
+        case "$RUNNER_OS" in
+          Linux)
+            echo "RUSTFLAGS=-C link-arg=-Wl,-rpath,$FOCUSWEAVE_OPENCV_LIB_DIR" >> "$GITHUB_ENV"
+            ;;
+          macOS)
+            echo "RUSTFLAGS=-C link-arg=-Wl,-rpath,@executable_path -C link-arg=-Wl,-rpath,@loader_path -C link-arg=-Wl,-rpath,$FOCUSWEAVE_OPENCV_LIB_DIR" >> "$GITHUB_ENV"
+            ;;
+        esac
