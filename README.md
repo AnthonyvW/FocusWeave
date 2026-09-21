@@ -12,9 +12,11 @@ margin widens with core count.
 
 Download
 --------
-Pre-built executables for Windows, macOS and Linux are available on the
+Pre-built archives for Windows, macOS and Linux are on the
 [releases tab](https://github.com/AnthonyvW/FocusWeave/releases), alongside
-Python wheels. Download the binary for your platform.
+Python wheels. Each archive holds the `focusweave` executable and the OpenCV
+libraries it needs, so nothing has to be installed first — unpack it and run
+the executable from the folder it came in.
 
 Basic usage
 -----------

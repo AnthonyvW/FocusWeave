@@ -56,14 +56,16 @@ Chocolatey puts OpenCV in `C:\tools\opencv`. In the shell you build from
     $env:OPENCV_LINK_PATHS    = "C:\tools\opencv\build\x64\vc16\lib"
     $env:OPENCV_LINK_LIBS     = "opencv_world4130"   # or "opencv_core4130,opencv_imgproc4130"
     $env:LIBCLANG_PATH        = "C:\Program Files\LLVM\bin"
-    $env:PATH = "C:\Program Files\LLVM\bin;C:\tools\opencv\build\x64\vc16\bin;$env:PATH"
+    $env:PATH = "C:\tools\opencv\build\x64\vc16\bin;$env:PATH"
 
-`LIBCLANG_PATH` tells the build script where to look; adding the same directory
-to `PATH` is what lets Windows actually load `libclang.dll` when the script
-runs. Setting only the first gives an opaque `exit code: 0xc0000135` from
-`build-script-build`, which is `STATUS_DLL_NOT_FOUND`.
+`LIBCLANG_PATH` is enough on its own: the crate is built with its
+`clang-runtime` feature, so the build script loads `libclang.dll` through that
+variable rather than having it resolved by the Windows loader at process start.
+Without that feature, `LIBCLANG_PATH` alone gives an opaque
+`exit code: 0xc0000135` from `build-script-build` — `STATUS_DLL_NOT_FOUND` —
+and the LLVM `bin` directory has to be on `PATH` as well.
 
-The OpenCV `bin` directory belongs on `PATH` too, because the resulting
+The OpenCV `bin` directory does belong on `PATH`, because the resulting
 `focusweave.exe` loads those DLLs at run time; copying them next to the
 executable works as well. Chocolatey ships the monolithic `opencv_world` build,
 which carries every module whether or not it is used; a modular OpenCV build
@@ -74,6 +76,10 @@ discovers everything by itself.
 **macOS:**
 
     brew install opencv llvm
+    export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+
+Homebrew keeps `llvm` keg-only, so `libclang.dylib` is not on the default
+search path and `LIBCLANG_PATH` has to name it.
 
 These Windows and macOS steps follow the `opencv` crate's own setup, which is
 the authoritative reference if something does not line up —
@@ -88,7 +94,21 @@ every environment variable it reads.
 
 The binary lands at `target/release/focusweave` (`focusweave.exe` on Windows).
 It is about 3.8 MB and links OpenCV's `core` and `imgproc` dynamically, another
-8.2 MB on Ubuntu.
+8.2 MB on Ubuntu, so it runs on the machine that built it but not on one
+without OpenCV installed.
+
+The release archives solve that by carrying the libraries beside the
+executable, which is also what `.github/workflows/build.yml` does if you want
+to produce a portable copy yourself:
+
+    python ci/bundle_elf.py target/release/focusweave FocusWeave-linux
+
+That copies every non-system library the binary loads into `FocusWeave-linux/`
+and rewrites `RPATH` to `$ORIGIN`, so the loader looks next to the executable
+first. It comes to about 27 MB, most of it LAPACK and libgfortran that Ubuntu's
+`libopencv_core` is linked against but FocusWeave never calls. The macOS
+equivalent is `dylibbundler`; on Windows it is copying `opencv_world*.dll` into
+the same folder.
 
 
 3. Run the CLI
@@ -340,13 +360,15 @@ to be importable still is, from the same module paths.
 8. Troubleshooting
 ------------------
 
-**`build-script-build` exits with `0xc0000135` on Windows.** That code is
-`STATUS_DLL_NOT_FOUND`: the `opencv` crate's build script started but could not
-load `libclang.dll`. `LIBCLANG_PATH` alone is not enough — the LLVM `bin`
-directory has to be on `PATH` in the same shell, as in
-[Install the prerequisites](#1-install-the-prerequisites). Check with
-`where libclang.dll`, and note that a virtualenv activated from a different
-shell can carry a different `PATH` than the one you built the CLI in.
+**`build-script-build` exits with `0xc0000135` on Windows, or dies with
+SIGABRT and `Library not loaded: @rpath/libclang.dylib` on macOS.** Both are
+the `opencv` crate's build script failing to find libclang. Set
+`LIBCLANG_PATH` to the directory holding `libclang.dll` or `libclang.dylib`,
+as in [Install the prerequisites](#1-install-the-prerequisites), and make sure
+it is set in the shell you actually build from — a virtualenv activated from a
+different shell carries a different environment than the one you built the CLI
+in. If you are on a checkout that predates the `clang-runtime` feature, the
+LLVM `bin` directory also has to be on `PATH`.
 
 **The build cannot find OpenCV.** The `opencv` crate reports what it looked for
 and where. On Linux it wants `pkg-config --modversion opencv4` to succeed; on
