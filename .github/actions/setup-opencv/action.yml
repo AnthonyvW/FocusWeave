@@ -1,0 +1,66 @@
+name: Set up OpenCV
+description: >
+  Install OpenCV 4 and libclang, then export everything the opencv crate needs
+  to find them. Outputs the directory holding the runtime libraries, for the
+  steps that bundle them into an artifact.
+
+outputs:
+  lib-dir:
+    description: Directory containing the OpenCV runtime libraries
+    value: ${{ steps.report.outputs.lib-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Linux
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libopencv-dev libclang-dev patchelf
+        echo "FOCUSWEAVE_OPENCV_LIB_DIR=$(pkg-config --variable=libdir opencv4)" >> "$GITHUB_ENV"
+
+    - name: macOS
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install opencv llvm
+        prefix="$(brew --prefix opencv)"
+        # Naming core and imgproc explicitly rather than letting pkg-config
+        # hand over every module: macOS links without --as-needed, so the
+        # pkg-config list would drag all of OpenCV into the artifact.
+        echo "OPENCV_INCLUDE_PATHS=$prefix/include/opencv4" >> "$GITHUB_ENV"
+        echo "OPENCV_LINK_PATHS=$prefix/lib"                >> "$GITHUB_ENV"
+        echo "OPENCV_LINK_LIBS=opencv_core,opencv_imgproc"  >> "$GITHUB_ENV"
+        echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"      >> "$GITHUB_ENV"
+        echo "FOCUSWEAVE_OPENCV_LIB_DIR=$prefix/lib"        >> "$GITHUB_ENV"
+
+    - name: Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        # The runner image already carries a newer LLVM than Chocolatey would
+        # install, and asking for one anyway fails the whole command.
+        if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
+          choco install --no-progress -y llvm
+        }
+        choco install --no-progress -y opencv --version=4.10.0
+
+        $lib = Get-ChildItem -Path C:\tools\opencv\build -Recurse -Filter "opencv_world*.lib" |
+               Select-Object -First 1
+        if (-not $lib) { throw "no opencv_world*.lib under C:\tools\opencv\build" }
+        $linkPath = $lib.Directory.FullName
+        $binPath  = Join-Path (Split-Path $linkPath -Parent) "bin"
+
+        "OPENCV_INCLUDE_PATHS=C:\tools\opencv\build\include" >> $env:GITHUB_ENV
+        "OPENCV_LINK_PATHS=$linkPath"                        >> $env:GITHUB_ENV
+        "OPENCV_LINK_LIBS=$($lib.BaseName)"                  >> $env:GITHUB_ENV
+        "LIBCLANG_PATH=C:\Program Files\LLVM\bin"            >> $env:GITHUB_ENV
+        "FOCUSWEAVE_OPENCV_LIB_DIR=$binPath"                 >> $env:GITHUB_ENV
+
+    - name: Report
+      id: report
+      shell: bash
+      run: |
+        echo "lib-dir=$FOCUSWEAVE_OPENCV_LIB_DIR" >> "$GITHUB_OUTPUT"
+        echo "OpenCV runtime libraries: $FOCUSWEAVE_OPENCV_LIB_DIR"

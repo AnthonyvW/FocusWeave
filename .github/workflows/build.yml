@@ -8,11 +8,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  # Chocolatey's OpenCV package; the version is pinned so the link libraries
-  # below keep matching it.
-  OPENCV_VERSION: "4.10.0"
-
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -21,7 +16,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev
+      - uses: ./.github/actions/setup-opencv
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -35,7 +30,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev patchelf
+      - uses: ./.github/actions/setup-opencv
       - run: pip install -r tests/requirements.txt maturin
       - run: cargo build --release -p focusweave-cli
       - run: maturin build --release --out dist
@@ -49,56 +44,97 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: FocusWeave-linux
-            built: target/release/focusweave
-            release_name: FocusWeave-linux
+            archive: FocusWeave-linux
           - os: windows-latest
-            artifact: FocusWeave-windows
-            built: target/release/focusweave.exe
-            release_name: FocusWeave-windows.exe
+            archive: FocusWeave-windows
           - os: macos-latest
-            artifact: FocusWeave-macos
-            built: target/release/focusweave
-            release_name: FocusWeave-macos
+            archive: FocusWeave-macos
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install OpenCV (Linux)
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: ./.github/actions/setup-opencv
+        id: opencv
+
+      - run: cargo build --release -p focusweave-cli
+
+      # OpenCV is linked dynamically, so a bare executable will not start on a
+      # machine that does not already have it. Each archive carries the
+      # libraries next to the binary, with the loader pointed at that directory.
+      - name: Bundle (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev
-      - name: Install OpenCV (macOS)
+        run: python ci/bundle_elf.py target/release/focusweave "${{ matrix.archive }}"
+
+      - name: Bundle (macOS)
         if: runner.os == 'macOS'
-        run: brew install opencv llvm
-      - name: Install OpenCV (Windows)
+        run: |
+          brew install dylibbundler
+          mkdir -p "${{ matrix.archive }}"
+          cp target/release/focusweave "${{ matrix.archive }}/"
+          dylibbundler --overwrite-files --bundle-deps --create-dir \
+            --fix-file "${{ matrix.archive }}/focusweave" \
+            --dest-dir "${{ matrix.archive }}/libs" \
+            --install-path "@executable_path/libs"
+          # Rewriting load commands invalidates the code signature, and arm64
+          # macOS refuses to start a binary whose signature does not match.
+          find "${{ matrix.archive }}" -type f -exec codesign --force --sign - {} \; 2>/dev/null || true
+
+      - name: Bundle (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install --no-progress -y llvm opencv --version=$env:OPENCV_VERSION
-          $v = $env:OPENCV_VERSION -replace '\.', '' -replace '0$', ''
-          "OPENCV_INCLUDE_PATHS=C:\tools\opencv\build\include"      >> $env:GITHUB_ENV
-          "OPENCV_LINK_PATHS=C:\tools\opencv\build\x64\vc16\lib"    >> $env:GITHUB_ENV
-          "OPENCV_LINK_LIBS=opencv_world$v"                         >> $env:GITHUB_ENV
-          "LIBCLANG_PATH=C:\Program Files\LLVM\bin"                 >> $env:GITHUB_ENV
-          # The build script loads libclang.dll, so LLVM must be on PATH too.
-          "C:\Program Files\LLVM\bin"                               >> $env:GITHUB_PATH
-          "C:\tools\opencv\build\x64\vc16\bin"                      >> $env:GITHUB_PATH
-      - run: cargo build --release -p focusweave-cli
-      - name: Name the artifact for release
+          New-Item -ItemType Directory -Force -Path "${{ matrix.archive }}" | Out-Null
+          Copy-Item target\release\focusweave.exe "${{ matrix.archive }}\"
+          Copy-Item "${{ steps.opencv.outputs.lib-dir }}\opencv_world*.dll" "${{ matrix.archive }}\"
+
+      # Run the bundle from a directory the build environment does not reach
+      # into, so a missing library fails here rather than for whoever downloads
+      # it. pillow writes the test frames; nothing in this step provides OpenCV.
+      - name: Smoke test
         shell: bash
         run: |
-          mkdir -p upload
-          cp "${{ matrix.built }}" "upload/${{ matrix.release_name }}"
+          [ "$RUNNER_OS" = "Windows" ] && exe=".exe" || exe=""
+          pip install numpy pillow
+          python ci/make_smoke_stack.py smoke-frames
+          mv "${{ matrix.archive }}" "$HOME/bundle-under-test"
+          "$HOME/bundle-under-test/focusweave$exe" smoke-frames --output smoke.png
+          python -c "
+          from PIL import Image
+          im = Image.open('smoke.png')
+          assert im.size[0] >= 320 and im.size[1] >= 240, im.size
+          print('stacked', im.size, im.mode)
+          "
+          mv "$HOME/bundle-under-test" "${{ matrix.archive }}"
+
+      - name: Archive
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "${{ matrix.archive }}.zip" "${{ matrix.archive }}"
+          else
+            tar czf "${{ matrix.archive }}.tar.gz" "${{ matrix.archive }}"
+          fi
+          ls -l ${{ matrix.archive }}.*
+
       - uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.artifact }}
-          path: upload/${{ matrix.release_name }}
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}.zip
+            ${{ matrix.archive }}.tar.gz
+          if-no-files-found: error
+
       - uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
         with:
-          files: upload/${{ matrix.release_name }}
+          files: |
+            ${{ matrix.archive }}.zip
+            ${{ matrix.archive }}.tar.gz
 
   wheels:
     name: Wheel (${{ matrix.os }})
@@ -115,37 +151,59 @@ jobs:
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install OpenCV (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libopencv-dev libclang-dev patchelf
-      - name: Install OpenCV (macOS)
-        if: runner.os == 'macOS'
-        run: brew install opencv llvm
-      - name: Install OpenCV (Windows)
+      - uses: ./.github/actions/setup-opencv
+        id: opencv
+
+      - run: pip install maturin
+
+      # No manylinux container: it has no OpenCV. The Linux wheel is therefore
+      # tagged for the runner's glibc rather than being broadly portable.
+      - run: maturin build --release --out dist
+
+      # maturin repairs Linux wheels itself. The other two need their OpenCV
+      # copied in by hand, or the wheel imports only on a machine that already
+      # has the library the build linked against.
+      - name: Repair (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: bash
         run: |
-          choco install --no-progress -y llvm opencv --version=$env:OPENCV_VERSION
-          $v = $env:OPENCV_VERSION -replace '\.', '' -replace '0$', ''
-          "OPENCV_INCLUDE_PATHS=C:\tools\opencv\build\include"      >> $env:GITHUB_ENV
-          "OPENCV_LINK_PATHS=C:\tools\opencv\build\x64\vc16\lib"    >> $env:GITHUB_ENV
-          "OPENCV_LINK_LIBS=opencv_world$v"                         >> $env:GITHUB_ENV
-          "LIBCLANG_PATH=C:\Program Files\LLVM\bin"                 >> $env:GITHUB_ENV
-          "C:\Program Files\LLVM\bin"                               >> $env:GITHUB_PATH
-          "C:\tools\opencv\build\x64\vc16\bin"                      >> $env:GITHUB_PATH
-      # `container: off` builds against the runner's own OpenCV rather than in a
-      # manylinux image, which has none. The Linux wheel is therefore tagged
-      # linux_x86_64, not manylinux; publishing a portable one means building a
-      # trimmed OpenCV inside the manylinux container first.
-      - uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          args: --release --out dist
-          container: off
+          pip install delvewheel
+          delvewheel repair --add-path "${{ steps.opencv.outputs.lib-dir }}" -w repaired dist/*.whl
+          rm -rf dist && mv repaired dist
+
+      - name: Repair (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pip install delocate
+          delocate-wheel -w repaired -v dist/*.whl
+          rm -rf dist && mv repaired dist
+
+      # A venv the build environment has not touched: if a library is missing
+      # from the wheel, the import fails here.
+      - name: Smoke test
+        shell: bash
+        run: |
+          python -m venv "$HOME/clean"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin="$HOME/clean/Scripts"; exe=".exe"; else bin="$HOME/clean/bin"; exe=""; fi
+          "$bin/pip" install pillow
+          "$bin/pip" install --no-index --find-links dist focusweave
+          "$bin/python" ci/make_smoke_stack.py smoke-frames
+          "$bin/python" -c "
+          from pathlib import Path
+          import focusweave
+          from focusweave import FocusStackConfig, run
+          result = run(FocusStackConfig(images=Path('smoke-frames')))
+          print('api ok', result.image.shape, result.image.dtype)
+          "
+          "$bin/focusweave$exe" smoke-frames --output cli.png
+          ls -l dist cli.png
+
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.os }}
           path: dist
+          if-no-files-found: error
+
       - uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
         with:

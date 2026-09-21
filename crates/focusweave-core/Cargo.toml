@@ -11,6 +11,13 @@ description = "Focus stacking via Laplacian pyramid fusion (core library)"
 image.workspace = true
 # Only core and imgproc are used; registration is implemented in this crate,
 # so opencv_video and everything it drags in stay out of the link.
-opencv = { version = "0.100", default-features = false, features = ["imgproc"] }
+#
+# clang-runtime makes the build script load libclang through LIBCLANG_PATH at
+# run time rather than linking it. Linked, the script inherits libclang's own
+# install layout as a load-time dependency, which fails on any machine where
+# that library is not on the default search path: Homebrew keeps llvm keg-only,
+# and on Windows setting LIBCLANG_PATH does not put the DLL on PATH, so the
+# script dies before main with SIGABRT or STATUS_DLL_NOT_FOUND respectively.
+opencv = { version = "0.100", default-features = false, features = ["imgproc", "clang-runtime"] }
 rayon.workspace = true
 rustfft.workspace = true
