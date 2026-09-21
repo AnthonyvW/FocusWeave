@@ -160,7 +160,9 @@ def main() -> int:
         run(configure)
         run(["cmake", "--build", str(build), "--config", "Release",
              "--parallel", str(args.jobs)])
-        run(["cmake", "--install", str(build), "--config", "Release"])
+        # --strip is worth about 2.5 MB of the two libraries, and every
+        # artifact carries them. MSVC has no strip tool and cmake skips it.
+        run(["cmake", "--install", str(build), "--config", "Release", "--strip"])
         marker.write_text(args.version)
 
     include = prefix / "include"
