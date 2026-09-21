@@ -37,6 +37,21 @@ ECC solver, which measures the same speed as OpenCV's; taking OpenCV's would
 mean linking `opencv_video`, and that drags in dnn, calib3d, features2d and
 flann for one function.
 
+A distribution OpenCV is the quick way to get building, and is what the
+per-platform commands below install. It is not what the releases are built
+against: `ci/build_opencv.py` compiles core and imgproc with everything
+optional turned off, and that build depends on nothing but the C and C++
+runtimes. A packaged one drags in a numerics and display stack FocusWeave
+never calls — on Ubuntu, LAPACK, BLAS, gfortran, GL and X11, thirteen
+libraries and 12.6 MB of them. If you are producing something to hand to
+someone else, build it:
+
+    python ci/build_opencv.py --version 4.10.0 --prefix ~/opencv-min \
+                              --env-file /dev/stdout
+
+That prints the four environment variables to export, and takes a few minutes.
+It needs cmake and a C++ compiler, and nothing else.
+
 **Linux (Debian, Ubuntu):**
 
     sudo apt-get install libopencv-dev libclang-dev
@@ -101,14 +116,17 @@ The release archives solve that by carrying the libraries beside the
 executable, which is also what `.github/workflows/build.yml` does if you want
 to produce a portable copy yourself:
 
-    python ci/bundle_elf.py target/release/focusweave FocusWeave-linux
+    python ci/bundle_elf.py target/release/focusweave FocusWeave-linux \
+        --search ~/opencv-min/lib
 
-That copies every non-system library the binary loads into `FocusWeave-linux/`
-and rewrites `RPATH` to `$ORIGIN`, so the loader looks next to the executable
-first. It comes to about 27 MB, most of it LAPACK and libgfortran that Ubuntu's
-`libopencv_core` is linked against but FocusWeave never calls. The macOS
-equivalent is `dylibbundler`; on Windows it is copying `opencv_world*.dll` into
-the same folder.
+That copies every non-system library the binary loads into `FocusWeave-linux/`,
+strips them, and rewrites `RPATH` to `$ORIGIN` so the loader looks next to the
+executable first. Against the minimal OpenCV that is two libraries and 13.8 MB;
+against Ubuntu's it is fifteen and 27 MB. A library it cannot resolve is a hard
+error rather than a quietly incomplete archive — pass `--search` for anything
+outside the system paths. On macOS and Windows the equivalent is copying the
+two `libopencv_*` files into the same folder, which works because the minimal
+build has no further dependencies of its own.
 
 
 3. Run the CLI

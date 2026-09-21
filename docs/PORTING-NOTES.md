@@ -40,6 +40,19 @@ imgproc the dependency is two libraries and 8.2 MB.
 Image decoding and encoding go through the `image` crate rather than
 `imgcodecs`, which would pull in libjpeg, libpng, libtiff and libwebp on top.
 
+The releases link an OpenCV built by `ci/build_opencv.py` rather than a
+packaged one, because every distribution's build carries a different set of
+things this project never calls, and each of them cost a day. Ubuntu's
+`libopencv_core` links LAPACK, BLAS, gfortran, GL and X11 — thirteen libraries
+beyond glibc. Homebrew's links OpenBLAS, which reaches libgcc through
+`@rpath`, which no relocation tool could resolve. Chocolatey ships only the
+monolithic `opencv_world`, carrying dnn, calib3d and the rest. Built with
+`BUILD_LIST=core,imgproc` and every optional dependency off, the result needs
+nothing but the C and C++ runtimes, which is what makes an artifact
+relocatable at all. It measures the same speed: 6.27 s against 6.25 s on the
+benchmark set, with identical output, so IPP and TBB were not buying
+anything here.
+
 This was not the first design. The port originally implemented every one of
 those routines in Rust and linked nothing, which made for a self-contained
 3.5 MB binary — and ran the benchmark set in 10.0 s, exactly level with the
