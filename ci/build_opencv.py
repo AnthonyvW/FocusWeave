@@ -31,6 +31,11 @@ MODULES = ["core", "imgproc"]
 
 FLAGS = [
     "-DCMAKE_BUILD_TYPE=Release",
+    # OpenCV 4.10 predates CMake 4, and several of its scripts still declare
+    # cmake_minimum_required(VERSION 2.8), which CMake 4 refuses outright. The
+    # macOS runner is the one carrying a CMake that new. Older CMake ignores
+    # this variable.
+    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
     f"-DBUILD_LIST={','.join(MODULES)}",
     "-DBUILD_SHARED_LIBS=ON",
     # Install the same way everywhere. Left alone, Windows installs into
@@ -40,7 +45,6 @@ FLAGS = [
     "-DOPENCV_3P_LIB_INSTALL_PATH=lib",
     "-DOPENCV_INCLUDE_INSTALL_PATH=include",
     "-DOPENCV_CONFIG_INSTALL_PATH=cmake",
-    "-DOPENCV_GENERATE_PKGCONFIG=ON",
     "-DOPENCV_GENERATE_SETUPVARS=OFF",
     # macOS only, and what makes the dylibs relocatable: their install name
     # becomes @rpath/... instead of this prefix, so copying them next to a
