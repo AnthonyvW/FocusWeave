@@ -41,7 +41,7 @@ runs:
         "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
     - name: Cache OpenCV
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/opencv-min
         key: opencv-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/build_opencv.py') }}

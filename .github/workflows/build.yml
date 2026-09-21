@@ -12,8 +12,8 @@ env:
   OPENCV_VERSION: "4.10.0"
 
 jobs:
-  # Populates the OpenCV cache once per platform so the six jobs below restore
-  # it rather than each building their own copy.
+  # Populates the OpenCV cache once per platform so the jobs below restore it
+  # rather than each building their own copy.
   opencv:
     name: OpenCV (${{ matrix.os }})
     strategy:
@@ -30,7 +30,11 @@ jobs:
         with:
           version: ${{ env.OPENCV_VERSION }}
 
-  check:
+  # Lints, unit tests and the comparison against the original Python
+  # implementation, in one job: they share a checkout, an OpenCV restore and a
+  # runner, and splitting them bought nothing but a second runner's overhead.
+  verify:
+    name: Verify
     needs: opencv
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -45,24 +49,11 @@ jobs:
       - uses: ./.github/actions/setup-opencv
         with:
           version: ${{ env.OPENCV_VERSION }}
+
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  compare:
-    name: Compare against the reference implementation
-    needs: opencv
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/setup-opencv
-        with:
-          version: ${{ env.OPENCV_VERSION }}
       - run: pip install -r tests/requirements.txt maturin
       - run: cargo build --release -p focusweave-cli
       - run: maturin build --release --out dist
@@ -100,7 +91,7 @@ jobs:
       - run: cargo build --release -p focusweave-cli
 
       # OpenCV is linked dynamically, so a bare executable will not start on a
-      # machine without it. Each archive carries the two libraries beside the
+      # machine without it. Each folder carries the two libraries beside the
       # binary; it is only two because the OpenCV built above has no LAPACK,
       # OpenBLAS or GL behind it.
       - name: Bundle (Linux)
@@ -115,7 +106,7 @@ jobs:
           mkdir -p "${{ matrix.archive }}"
           cp target/release/focusweave "${{ matrix.archive }}/"
           # -a to keep the symlinks: each library installs as one real file and
-          # two links, and a dereferencing copy would triple the archive.
+          # two links, and a dereferencing copy would triple the folder.
           cp -a "${{ steps.opencv.outputs.lib-dir }}"/libopencv_*.dylib "${{ matrix.archive }}/"
 
       - name: Bundle (Windows)
@@ -129,9 +120,8 @@ jobs:
       # The OpenCV install is moved out of the way first, and the bundle run
       # from a directory the build never touched. Without that, the rpath
       # pointing at the build machine's OpenCV resolves and the test passes on
-      # an archive containing no libraries at all -- which is exactly what it
-      # did before this step hid it. pillow writes the frames; nothing here
-      # provides OpenCV.
+      # a folder containing no libraries at all. pillow writes the frames;
+      # nothing here provides OpenCV.
       - name: Smoke test
         shell: bash
         run: |
@@ -151,7 +141,18 @@ jobs:
           mv "$HOME/bundle-under-test" "${{ matrix.archive }}"
           du -sh "${{ matrix.archive }}"
 
-      - name: Archive
+      # The folder itself, not an archive of it: upload-artifact zips whatever
+      # it is given, and handing it a .zip produced a zip inside a zip.
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}/
+          if-no-files-found: error
+
+      # A release asset has to be a single file, so the archive is built only
+      # when there is a release to attach it to.
+      - name: Archive for release
+        if: github.event_name == 'release'
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -159,15 +160,6 @@ jobs:
           else
             tar czf "${{ matrix.archive }}.tar.gz" "${{ matrix.archive }}"
           fi
-          ls -l ${{ matrix.archive }}.*
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: ${{ matrix.archive }}
-          path: |
-            ${{ matrix.archive }}.zip
-            ${{ matrix.archive }}.tar.gz
-          if-no-files-found: error
 
       - uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
@@ -176,6 +168,83 @@ jobs:
             ${{ matrix.archive }}.zip
             ${{ matrix.archive }}.tar.gz
 
+  # Linux wheels build inside a manylinux container, so the result installs on
+  # any distribution back to glibc 2.28 rather than only on one as new as the
+  # runner. That means OpenCV has to be built in there too, since the image has
+  # none -- which is why this is a separate job from the other two platforms.
+  wheel-manylinux:
+    name: Wheel (manylinux_2_28)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Installed into the workspace rather than the container's own
+      # filesystem, which is the only part the host can see and cache.
+      - uses: actions/cache@v6
+        with:
+          path: opencv-manylinux
+          key: opencv-${{ env.OPENCV_VERSION }}-manylinux_2_28-${{ hashFiles('ci/build_opencv.py') }}
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          manylinux: "2_28"
+          # The version is substituted before the container starts rather than
+          # read from the environment inside it, so nothing depends on which
+          # variables the action forwards.
+          before-script-linux: |
+            dnf install -y clang-devel cmake
+            # The image's system python is too old for this script; its own
+            # interpreters are not.
+            /opt/python/cp312-cp312/bin/python ci/build_opencv.py \
+              --version "${{ env.OPENCV_VERSION }}" \
+              --prefix "$(pwd)/opencv-manylinux" \
+              --env-file /tmp/opencv.env
+            set -a
+            . /tmp/opencv.env
+            set +a
+            export LIBCLANG_PATH=/usr/lib64
+            # The rpath is how the extension finds OpenCV before auditwheel
+            # rewrites it; LD_LIBRARY_PATH is how auditwheel itself finds the
+            # libraries to copy in, and does not depend on maturin keeping the
+            # RUSTFLAGS we set here.
+            export RUSTFLAGS="-C link-arg=-Wl,-rpath,${FOCUSWEAVE_OPENCV_LIB_DIR}"
+            export LD_LIBRARY_PATH="${FOCUSWEAVE_OPENCV_LIB_DIR}:${LD_LIBRARY_PATH}"
+
+      - name: Smoke test
+        run: |
+          trap 'mv opencv-hidden opencv-manylinux 2>/dev/null || true' EXIT
+          mv opencv-manylinux opencv-hidden
+          python -m venv "$HOME/clean"
+          "$HOME/clean/bin/pip" install numpy pillow
+          "$HOME/clean/bin/pip" install --no-index --find-links dist focusweave
+          "$HOME/clean/bin/python" ci/make_smoke_stack.py smoke-frames
+          "$HOME/clean/bin/python" -c "
+          from pathlib import Path
+          from focusweave import FocusStackConfig, run
+          result = run(FocusStackConfig(images=Path('smoke-frames')))
+          print('api ok', result.image.shape, result.image.dtype)
+          "
+          "$HOME/clean/bin/focusweave" smoke-frames --output cli.png
+          ls -l dist
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-manylinux
+          path: dist
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'release'
+        with:
+          files: dist/*
+
   wheels:
     name: Wheel (${{ matrix.os }})
     needs: opencv
@@ -183,7 +252,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -199,14 +268,10 @@ jobs:
           version: ${{ env.OPENCV_VERSION }}
 
       - run: pip install maturin
-
-      # No manylinux container: it has no OpenCV. The Linux wheel is therefore
-      # tagged for the runner's glibc rather than being broadly portable.
       - run: maturin build --release --out dist
 
-      # maturin repairs the Linux wheel itself. It leaves the macOS one alone
-      # -- it produced a 1.3 MB wheel with no dylibs in it -- so delocate does
-      # that, and delvewheel the Windows DLLs.
+      # maturin repairs neither of these: it left the macOS wheel at 1.3 MB
+      # with no dylibs in it, and has no Windows equivalent at all.
       - name: Repair (macOS)
         if: runner.os == 'macOS'
         run: |
