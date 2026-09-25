@@ -291,9 +291,19 @@ in one band.
     ./target/release/focusweave --batch shoot/
     ./target/release/focusweave --batch shoot/ --output results/ --crop
 
-Each result is a JPEG named after its subfolder — `beetle.jpg`, `moss.jpg`,
-`pollen.jpg` — written into `shoot/` itself, or into the folder `--output`
-names, which is created if it does not exist. With `--batch`, `--output` is
+Each result is named after its subfolder — `beetle`, `moss`, `pollen` — and
+written into `shoot/` itself, or into the folder `--output` names, which is
+created if it does not exist.
+
+`--batch-format` picks the format. The default, `inherit`, uses the most common
+extension among each set's own images, so a set of 16-bit TIFFs comes out as a
+16-bit TIFF and a set of JPEGs as a JPEG — in the example above, `beetle.tiff`
+and `moss.jpg`. A folder that mixes formats gets whichever is most common, with
+a tie going to the one whose file sorts first by name. Give an extension
+instead to write every set the same way:
+
+    ./target/release/focusweave --batch shoot/ --batch-format tiff
+ With `--batch`, `--output` is
 always a folder; a name ending in an image extension is rejected rather than
 quietly turned into one. Every other flag applies to each set, and
 `--output-steps` puts each set's slabs in `focusweave_slabs/<set>/`.

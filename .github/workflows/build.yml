@@ -130,8 +130,12 @@ jobs:
           mkdir smoke-batch
           cp -r smoke-frames smoke-batch/a
           cp -r smoke-frames smoke-batch/b
+          # The frames are PNG, so the default --batch-format inherit has to
+          # give PNG results, and an explicit format has to override it.
           "$HOME/bundle-under-test/focusweave$exe" --batch smoke-batch --output smoke-batch-out
-          test -f smoke-batch-out/a.jpg && test -f smoke-batch-out/b.jpg
+          test -f smoke-batch-out/a.png && test -f smoke-batch-out/b.png
+          "$HOME/bundle-under-test/focusweave$exe" --batch smoke-batch --output smoke-batch-jpg --batch-format jpg
+          test -f smoke-batch-jpg/a.jpg && test -f smoke-batch-jpg/b.jpg
           mv "$HOME/bundle-under-test" "${{ matrix.archive }}"
           du -sh "${{ matrix.archive }}"
 

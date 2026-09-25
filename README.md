@@ -108,10 +108,14 @@ Batch mode stacks a folder of folders, treating each subfolder as its own set:
     focusweave --batch path/to/shoot/ --output path/to/results/
 
     --batch FOLDER          Stack each subfolder of FOLDER separately. Results are
-                            JPEGs named after their subfolder, written into FOLDER,
+                            named after their subfolder and written into FOLDER,
                             or into --output, which is then a folder rather than a
                             file. Every other option applies to each set. A set that
                             fails is reported and the rest carry on.
+    --batch-format EXT      Format for batch results: inherit (the default), or an
+                            extension such as tiff, png or jpg. inherit uses the
+                            most common extension among each set's images, so a set
+                            of 16-bit TIFFs comes out as a 16-bit TIFF.
 
 **Other**
 

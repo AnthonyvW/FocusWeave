@@ -14,6 +14,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// never treats as an image set, since a previous run may have created it.
 const SLAB_DIR: &str = "focusweave_slabs";
 
+/// The `--batch-format` value that takes each set's format from its images.
+const INHERIT: &str = "inherit";
+
 const HELP: &str = r#"Focus stack a folder of images using Laplacian pyramid fusion.
 
 Usage: focusweave FOLDER [OPTIONS]
@@ -27,9 +30,13 @@ Output options
 
 Batch options
   --batch FOLDER          Stack each subfolder of FOLDER as a separate set of
-                          images. Each result is saved as a JPEG named after its
-                          subfolder, in FOLDER itself unless --output names
-                          another folder. Every other option applies to each set.
+                          images. Each result is named after its subfolder and
+                          saved in FOLDER itself unless --output names another
+                          folder. Every other option applies to each set.
+  --batch-format EXT      Format for batch results: inherit, or an extension such
+                          as tiff, png or jpg (default: inherit). inherit uses the
+                          most common extension among each set's images, so a
+                          set of 16-bit TIFFs keeps its depth.
 
 Alignment options
   --no-align              Skip alignment (use when images are already registered).
@@ -87,6 +94,7 @@ Other
 struct Args {
     folder: Option<PathBuf>,
     batch: Option<PathBuf>,
+    batch_format: Option<String>,
     output: Option<PathBuf>,
     quality: Option<u8>,
     slab_format: Option<String>,
@@ -144,6 +152,7 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
                 return Ok(None);
             }
             "--batch" => args.batch = Some(PathBuf::from(next(&mut i, "batch")?)),
+            "--batch-format" => args.batch_format = Some(next(&mut i, "batch-format")?),
             "--output" => args.output = Some(PathBuf::from(next(&mut i, "output")?)),
             "--quality" => args.quality = Some(parse_number("quality", &next(&mut i, "quality")?)?),
             "--slab-format" => args.slab_format = Some(next(&mut i, "slab-format")?),
@@ -206,6 +215,13 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
         i += 1;
     }
 
+    if let Some(raw) = args.batch_format.take() {
+        if args.batch.is_none() {
+            return Err("--batch-format only applies with --batch".into());
+        }
+        args.batch_format = Some(normalise_batch_format(&raw)?);
+    }
+
     match (&args.folder, &args.batch) {
         (Some(_), Some(_)) => {
             return Err("give either a folder or --batch FOLDER, not both".into());
@@ -234,6 +250,21 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
         }
     }
     Ok(Some(Parsed { cfg, args }))
+}
+
+fn normalise_batch_format(raw: &str) -> Result<String, String> {
+    let format = raw.trim_start_matches('.').to_ascii_lowercase();
+    let supported: Vec<&str> = IMAGE_EXTENSIONS
+        .iter()
+        .map(|e| e.trim_start_matches('.'))
+        .collect();
+    if format == INHERIT || supported.contains(&format.as_str()) {
+        return Ok(format);
+    }
+    Err(format!(
+        "--batch-format expects {INHERIT} or one of {}, got '{raw}'",
+        supported.join(", ")
+    ))
 }
 
 /// Accumulates wall time per pipeline stage from the progress callback.
@@ -368,7 +399,7 @@ fn execute_batch(
     }
 
     let mut failed = Vec::new();
-    for (index, folder) in sets.iter().enumerate() {
+    for (index, (folder, images)) in sets.iter().enumerate() {
         let name = folder
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -377,7 +408,11 @@ fn execute_batch(
 
         let mut set_cfg = cfg.clone();
         set_cfg.images = Images::Folder(folder.clone());
-        let out_path = out_dir.join(format!("{name}.jpg"));
+        let extension = match args.batch_format.as_deref() {
+            None | Some(INHERIT) => inherited_extension(images),
+            Some(fixed) => fixed.to_string(),
+        };
+        let out_path = out_dir.join(format!("{name}.{extension}"));
         let steps_dir = out_dir.join(SLAB_DIR).join(&name);
         match stack_one(&set_cfg, args, &out_path, &steps_dir, timer) {
             Ok(()) => {}
@@ -401,12 +436,13 @@ fn execute_batch(
     Ok(failed.len())
 }
 
-/// Subfolders of `batch` holding at least one image, sorted by name.
+/// Subfolders of `batch` holding at least one image, with those images, sorted
+/// by folder name.
 ///
 /// The output folder and the slab folder are left out even when they sit
 /// inside `batch`: both fill with images, and without this a second run of the
 /// same batch would stack its own previous results as another set.
-fn discover_sets(batch: &Path, out_dir: &Path) -> Result<Vec<PathBuf>, Error> {
+fn discover_sets(batch: &Path, out_dir: &Path) -> Result<Vec<(PathBuf, Vec<PathBuf>)>, Error> {
     let entries = std::fs::read_dir(batch)
         .map_err(|e| Error::Config(format!("could not read '{}': {e}", batch.display())))?;
     let out_dir = out_dir.canonicalize().ok();
@@ -426,12 +462,37 @@ fn discover_sets(batch: &Path, out_dir: &Path) -> Result<Vec<PathBuf>, Error> {
         }
         match list_folder(&path) {
             Ok(images) if images.is_empty() => println!("Skipping {name}: no images"),
-            Ok(_) => sets.push(path),
+            Ok(images) => sets.push((path, images)),
             Err(e) => println!("Skipping {name}: {e}"),
         }
     }
-    sets.sort();
+    sets.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(sets)
+}
+
+/// The extension a set is saved with under `--batch-format inherit`: the most
+/// common one among its images. A tie goes to whichever appears first by file
+/// name, so a mixed folder still gets the same answer every run.
+fn inherited_extension(images: &[PathBuf]) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let extensions = images
+        .iter()
+        .filter_map(|p| p.extension())
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    for extension in extensions {
+        match counts.iter_mut().find(|(e, _)| *e == extension) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((extension, 1)),
+        }
+    }
+    // max_by_key keeps the last of equal maxima; reversing makes that the
+    // first seen.
+    counts
+        .into_iter()
+        .rev()
+        .max_by_key(|(_, n)| *n)
+        .map(|(e, _)| e)
+        .unwrap_or_else(|| "jpg".into())
 }
 
 /// Stack one folder and write the result, or its slabs, to disk.
