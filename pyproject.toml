@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "focusweave"
-version = "2.0.0rc1"
+version = "2.0.0"
 description = "Focus stacking via Laplacian pyramid fusion"
 readme = "README.md"
 license = { file = "LICENSE" }
