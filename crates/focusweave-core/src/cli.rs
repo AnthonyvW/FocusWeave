@@ -66,7 +66,8 @@ Stacking options
   --workers N             Number of frames fused concurrently. The default picks
                           one per core, capped so their buffers fit in free
                           memory; pass a number to override it. Each worker costs
-                          roughly 110 MB per megapixel of output.
+                          roughly 110 MB per megapixel of output (160 MB for
+                          16-bit sources).
 
 Culling options
   --cull [THRESHOLD]      Remove wholly out-of-focus images before stacking. Frames
@@ -185,7 +186,9 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
             }
             "--workers" => cfg.workers = parse_number("workers", &next(&mut i, "workers")?)?,
             "--cull" => {
-                // The threshold is optional, exactly as in the Python CLI.
+                // The threshold is optional, as in the Python CLI. Unlike
+                // argparse, a following non-number is left for the folder
+                // argument rather than rejected.
                 let takes_value = argv
                     .get(i + 1)
                     .map(|v| !v.starts_with("--") && v.parse::<f64>().is_ok())

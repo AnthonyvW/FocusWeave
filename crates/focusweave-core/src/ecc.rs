@@ -116,7 +116,7 @@ fn mat_vec(m: &[f64], v: &[f64], n: usize) -> Vec<f64> {
 /// The Jacobian of the warped image with respect to the six affine parameters
 /// is never materialised. Each of its six planes is a warped gradient times a
 /// coordinate weight, so every entry of the Hessian and of the projections can
-/// be summed in a single pass over the gradients — 39 dot products over six
+/// be summed in a single pass over the gradients — 33 dot products over six
 /// full-resolution planes collapse into one traversal.
 #[derive(Clone)]
 struct Normals {

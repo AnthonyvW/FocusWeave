@@ -227,8 +227,8 @@ fn fuse_one(
                 data: warped.data.iter().map(|v| f32::from(*v)).collect(),
             }
         };
-        // OpenCV's Lab conversion is 8-bit only, so the frame is scaled into
-        // that range first, truncating exactly as the reference does.
+        // The reference takes Lab from an 8-bit frame, so the frame is scaled
+        // into that range first, truncating exactly as the reference does.
         let as_u8 = MatU8 {
             h: native.h,
             w: native.w,
@@ -330,11 +330,9 @@ pub fn stack_images(
     let done = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel::<Result<(usize, Partial), Error>>();
 
-    // Rayon tasks rather than OS threads. The filters these call parallelise
-    // internally, and rayon composes nested parallelism from inside its own
-    // pool; injecting it from foreign threads instead makes every inner
-    // parallel_for a cross-thread handshake, which costs more the more cores
-    // the machine has.
+    // `in_place_scope` keeps this closure, and with it every hook call, on the
+    // calling thread. The OpenCV kernels the tasks call parallelise on
+    // OpenCV's own thread pool, not rayon's.
     rayon::in_place_scope(|scope| {
         for (start, end) in batches.iter().copied() {
             let tx = tx.clone();

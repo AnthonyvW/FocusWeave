@@ -207,7 +207,7 @@ fn mat_to_py<'py>(py: Python<'py>, m: &Mat) -> PyResult<Bound<'py, PyArray2<f32>
 
 /// Bridges Python callables into the core's hook closures.
 ///
-/// The core releases the GIL for the duration of a run, so every callback
+/// `with_hooks` releases the GIL for the duration of a run, so every callback
 /// reacquires it. An exception raised inside a callback is stored and used to
 /// stop the run at the next checkpoint, then re-raised to the caller.
 struct Callbacks {
