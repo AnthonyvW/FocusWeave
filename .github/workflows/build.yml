@@ -320,3 +320,70 @@ jobs:
         if: github.event_name == 'release'
         with:
           files: dist/*
+
+  # For platforms without a wheel, pip falls back to this and compiles, which
+  # needs the prerequisites in RUNNING.md.
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'release'
+        with:
+          files: dist/*
+
+  # Both publish jobs need every build to have succeeded, since a version can
+  # never be uploaded twice and a partial upload would leave a platform
+  # without a wheel for good. The environment names must match the trusted
+  # publishers registered on TestPyPI and PyPI.
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: [wheel-manylinux, wheels, sdist]
+    if: github.event_name == 'release' && github.event.release.prerelease
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/focusweave
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish:
+    name: Publish to PyPI
+    needs: [wheel-manylinux, wheels, sdist]
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/focusweave
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
