@@ -73,7 +73,8 @@ Command-line options
     --workers N             Number of frames fused concurrently. The default is automatic:
                             one per core, capped so the workers' buffers fit in free
                             memory. Each worker costs roughly 110 MB per megapixel of
-                            output. Pass a number to override it.
+                            output (160 MB for 16-bit sources). Pass a number to
+                            override it.
 
     Culling options
     --cull [THRESHOLD]      Remove wholly out-of-focus images before stacking. Each frame
@@ -126,9 +127,10 @@ Batch mode stacks a folder of folders, treating each subfolder as its own set:
 
 Memory usage
 ------------
-Peak memory is roughly 110 MB per megapixel of output per worker. The worker
-count defaults to one per core, capped so those buffers fit in free memory. To
-cut memory to the minimum at the cost of throughput:
+Peak memory is roughly 110 MB per megapixel of output per worker, or 160 MB
+for 16-bit sources. The worker count defaults to one per core, capped so those
+buffers fit in free memory. To cut memory to the minimum at the cost of
+throughput:
 
     focusweave path/to/images/ --workers 1
 
@@ -149,6 +151,9 @@ Or install it into your environment directly:
 
     pip install "focusweave @ git+https://github.com/AnthonyvW/FocusWeave.git"
 
+Installing from git builds from source, so it needs the prerequisites listed
+under [Building from source](#building-from-source).
+
 All public symbols are importable from the top-level `focusweave` package.
 Only numpy is required at runtime. The main entry point is `FocusStackConfig`
 and `run`:
@@ -160,7 +165,7 @@ from focusweave import FocusStackConfig, run
 cfg = FocusStackConfig(images=Path("path/to/images/"))
 result = run(cfg)
 
-# result.image is a uint8 RGB numpy array
+# result.image is a uint8 (or uint16) RGB numpy array
 ```
 
 Images can be supplied as a folder path, a list of `Path` objects, or a list of
@@ -178,6 +183,7 @@ result = run(cfg)
 A progress callback can be passed to `run` to receive stage-by-stage updates:
 
 ```python
+from pathlib import Path
 from focusweave import FocusStackConfig, run
 
 def on_progress(fraction: float, stage: str, message: str) -> None:
@@ -210,6 +216,7 @@ except Interrupted:
 Images can be read and written without pulling in another imaging library:
 
 ```python
+from pathlib import Path
 from focusweave import load_image, save_image
 
 frame = load_image(Path("frame_00.tiff"))   # uint8 or uint16 RGB
@@ -245,8 +252,8 @@ Python package, via [maturin](https://maturin.rs):
 Once installed, the `focusweave` command is available on your PATH and is the
 same CLI as the native binary.
 
-[RUNNING.md](RUNNING.md) walks through building, testing and benchmarking in
-more detail. [docs/PORTING-NOTES.md](docs/PORTING-NOTES.md) records how the
+[RUNNING.md](RUNNING.md) walks through building, running and troubleshooting
+in more detail. [docs/PORTING-NOTES.md](docs/PORTING-NOTES.md) records how the
 Rust implementation relates to the original Python one, including where the two
 deliberately differ.
 

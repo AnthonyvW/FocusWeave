@@ -62,8 +62,8 @@ deleted; the history has them. What they cost in maintenance was a second
 implementation of every primitive, with its own border handling, its own
 rounding, and its own SIMD, to stay within a few LSB of the library the
 reference was calling anyway. What they bought was portability. The exchange
-rate was not good, and the performance section below records why: the gap was
-not the instruction set.
+rate was not good, and the last section below records why: the gap was not
+the instruction set.
 
 Where the port is not bit-exact
 -------------------------------
@@ -107,10 +107,10 @@ accumulator computed
 
 which counts pyramid *levels*, not images — it is `levels + 1` from the first
 frame onward. The unweighted average that blends in where no frame carries
-sharpness was therefore divided by 6 rather than by the number of frames seen,
-making flat regions of the preview progressively too bright. The port tracks
-the real frame count. This affects only the on-screen preview, never a stacked
-output.
+sharpness was therefore divided by a constant (6 at typical preview sizes)
+rather than by the number of frames seen, making flat regions of the preview
+progressively too bright. The port tracks the real frame count. This affects
+only the on-screen preview, never a stacked output.
 
 **Sources are stretched to the canvas before being warped.** `stack_images`
 loads each frame with `_load_raw(path, cv2_size)`, where `cv2_size` is the
@@ -153,12 +153,14 @@ Performance work
 What the port is faster at is everything around the kernels, since the kernels
 are the same ones the reference called. Four changes account for most of it:
 
-- **The ECC normal equations are accumulated in one pass.** The reference
-  materialises the Jacobian as six full-resolution planes and then takes 39
-  dot products over them. Since each plane is a warped gradient times a
-  coordinate weight, every entry of the Hessian and of the projections can be
-  summed in a single traversal. This cut `run_ecc` from 3.1 s to 2.1 s on the
-  benchmark set before any parallelism.
+- **The ECC normal equations are accumulated in one pass.** The
+  `cv2.findTransformECC` the reference calls materialises the Jacobian as six
+  full-resolution planes and then takes 39 dot products over them. Since each
+  plane is a warped gradient times a coordinate weight, every entry of the
+  Hessian and of the image and template projections can be summed in a single
+  traversal, leaving only the error projection for a second pass. This
+  cut `run_ecc` from 3.1 s to 2.1 s on the benchmark set before any
+  parallelism.
 - **Frames are fused concurrently, and the worker count is sized to the
   machine.** Much of fusing a frame is per-pixel work that no individual
   kernel parallelises, so coarse parallelism over frames is what scales. The
@@ -166,10 +168,11 @@ are the same ones the reference called. Four changes account for most of it:
   twenty-thread machine mostly idle; the default is now one worker per core,
   capped by measured free memory, since each costs about 110 MB per megapixel
   of output.
-- **The fusion workers are rayon tasks, not OS threads.** OpenCV parallelises
-  internally too, and injecting work into a thread pool from foreign threads
-  turns every inner parallel region into a cross-thread handshake.
-  `in_place_scope` is what allows running the workers on rayon's own pool
+- **The fusion workers are rayon tasks, not OS threads.** That was decided
+  while the kernels were this crate's own and parallelised on rayon, where
+  injecting work from foreign threads turns every inner parallel region into
+  a cross-thread handshake. The OpenCV kernels now parallelise on OpenCV's own
+  pool. `in_place_scope` is what allows running the workers on rayon's pool
   while the non-`Send` progress hooks stay on the calling thread.
 - **Large scratch buffers go through an allocator that caches them.** The
   pipeline allocates and frees multi-megabyte buffers on every pyramid level.

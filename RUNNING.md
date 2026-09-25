@@ -124,9 +124,11 @@ strips them, and rewrites `RPATH` to `$ORIGIN` so the loader looks next to the
 executable first. Against the minimal OpenCV that is two libraries and 13.8 MB;
 against Ubuntu's it is fifteen and 27 MB. A library it cannot resolve is a hard
 error rather than a quietly incomplete archive — pass `--search` for anything
-outside the system paths. On macOS and Windows the equivalent is copying the
-two `libopencv_*` files into the same folder, which works because the minimal
-build has no further dependencies of its own.
+outside the system paths. On macOS, `ci/bundle_macho.py` takes the same
+arguments and copies the two dylibs beside a binary linked with an
+`@executable_path` rpath; on Windows the equivalent is copying the two
+`opencv_*.dll` files into the same folder. Both work because the minimal build
+has no further dependencies of its own.
 
 
 3. Run the CLI
@@ -136,7 +138,8 @@ build has no further dependencies of its own.
     ./target/release/focusweave path/to/images/
 
 By default it writes `stacked.jpg` into the input folder. Every flag from the
-old Python CLI is accepted, with identical names and defaults:
+old Python CLI is accepted, with identical names and, apart from `--workers`
+(now automatic rather than 3), identical defaults:
 
     ./target/release/focusweave path/to/images/ --output result.tiff --workers 0
     ./target/release/focusweave path/to/images/ --cull --crop
@@ -202,8 +205,8 @@ this. That is the trade being made: a wheel that carries a private copy of
 OpenCV alongside whatever `cv2` the environment already has, in exchange for
 the speed in [What to look at first](#7-what-to-look-at-first).
 
-The public API is unchanged, so anything written against the old package keeps
-working:
+The public API is unchanged apart from `workers` now defaulting to automatic
+rather than 3, so anything written against the old package keeps working:
 
 ```python
 from pathlib import Path
@@ -217,6 +220,7 @@ Progress, cancellation and slab callbacks work as before. Exceptions raised
 inside a callback propagate out of `run`:
 
 ```python
+from pathlib import Path
 from focusweave import FocusStackConfig, Interrupted, run
 
 cancelled = False
@@ -303,10 +307,11 @@ a tie going to the one whose file sorts first by name. Give an extension
 instead to write every set the same way:
 
     ./target/release/focusweave --batch shoot/ --batch-format tiff
- With `--batch`, `--output` is
-always a folder; a name ending in an image extension is rejected rather than
-quietly turned into one. Every other flag applies to each set, and
-`--output-steps` puts each set's slabs in `focusweave_slabs/<set>/`.
+
+With `--batch`, `--output` is always a folder; a name ending in an image
+extension is rejected rather than quietly turned into one. Every other flag
+applies to each set, and `--output-steps` puts each set's slabs in
+`focusweave_slabs/<set>/`.
 
 Subfolders with no images are skipped with a note, and hidden folders are
 ignored. A set that fails — too few images, a file that will not decode — is
@@ -333,8 +338,8 @@ Some things worth poking at, in rough order of how likely they are to matter
 to you:
 
 **Does it produce the picture you expect.** Run it on a real stack you already
-have a known-good result for and compare. This is the check that matters; the
-synthetic tests only prove the port is faithful, not that you like the output.
+have a known-good result for and compare. This is the check that matters; a
+synthetic stack only proves the pipeline runs, not that you like the output.
 
 **Speed.** On 4 cores, 25 frames at 2592x1944, best of three:
 
@@ -421,10 +426,10 @@ output, `stacked.jpg`, is written inside the input folder, and the next run of
 that folder sees it as one more frame. This is how the original behaved too.
 Pass `--output` somewhere else, or delete it before re-running.
 
-**WebP output fails.** WebP encoding is lossless-only here, and 16-bit images
-are reduced to 8-bit for it, as for JPEG. Prefer PNG or TIFF for 16-bit
-output.
+**WebP output is larger than expected.** WebP encoding is lossless-only here,
+and 16-bit images are reduced to 8-bit for it, as for JPEG. Prefer PNG or TIFF
+for 16-bit output.
 
 **A stack takes much more memory than expected.** Peak memory scales with
-`--workers`. Drop to `--workers 1` to roughly halve it at the cost of
+`--workers`. Drop to `--workers 1` to bring it to the minimum at the cost of
 throughput.

@@ -43,9 +43,9 @@ class StreamingFocusStacker:
             stacker.add_image(img)
         result = stacker.finish()
 
-    Thread safety: add_image is not thread-safe. Call it from a single thread,
-    typically your acquisition loop. finish() must only be called after the
-    last add_image call has returned.
+    Thread safety: the stacker is bound to the thread that created it, and
+    using it from any other thread fails. Create it, add images and call
+    finish() on one thread, typically your acquisition loop.
     """
 
     def __init__(
