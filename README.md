@@ -5,18 +5,13 @@ Focus stacking via Laplacian pyramid fusion. Takes a set of images captured at
 different focus distances and combines them into a single image where the entire
 subject is sharp.
 
-Written in Rust, with Python bindings and OpenCV underneath for the
-image-processing kernels. On a four-core machine it stacks 25 frames at
-2592x1944 in 6.3 s against the original Python implementation's 9.6 s, and the
-margin widens with core count.
-
 Download
 --------
 Pre-built archives for Windows, macOS and Linux are on the
 [releases tab](https://github.com/AnthonyvW/FocusWeave/releases), alongside
-Python wheels. Each archive holds the `focusweave` executable and the OpenCV
-libraries it needs, so nothing has to be installed first — unpack it and run
-the executable from the folder it came in.
+Python wheels. FocusWeave can also be installed via 
+
+    pip install FocusWeave
 
 Basic usage
 -----------
@@ -25,21 +20,16 @@ that folder:
 
     focusweave path/to/images/
 
-Input images can be JPG, PNG, TIFF, or WebP. Output format is inferred
-from the extension:
+To output to a specific file, format it as so.
 
     focusweave path/to/images/ --output result.tiff
-
-For the full list of options:
-
-    focusweave --help
 
 Command-line options
 --------------------
 
 **Output options**
 
-    --output PATH           Output file path (default: stacked.jpg in the input folder).
+    --output PATH           Output file path, supports JPG, PNG, TIFF, and WebP images.
     --quality N             JPEG output quality 1–95 (default: 95).
 
     Alignment options
@@ -124,32 +114,22 @@ Batch mode stacks a folder of folders, treating each subfolder as its own set:
     --version, -V           Show the version number and exit.
     --opencv-version        Show the version of the OpenCV library in use and exit.
     --formats               List the supported image extensions and exit.
+    --help                  Displays the list of commands
 
 Memory usage
 ------------
 Peak memory is roughly 110 MB per megapixel of output per worker, or 160 MB
 for 16-bit sources. The worker count defaults to one per core, capped so those
 buffers fit in free memory. To cut memory to the minimum at the cost of
-throughput:
+processing time, set workers to 1:
 
     focusweave path/to/images/ --workers 1
 
 Python API
 ----------
-focusweave can be installed as a dependency in your own project and used
-directly as a library without going through the CLI. Add it to your
-`pyproject.toml`:
+focusweave can be installed into your environment directly via pip:
 
-```toml
-[project]
-dependencies = [
-    "focusweave @ git+https://github.com/AnthonyvW/FocusWeave.git",
-]
-```
-
-Or install it into your environment directly:
-
-    pip install "focusweave @ git+https://github.com/AnthonyvW/FocusWeave.git"
+    pip install focusweave
 
 Installing from git builds from source, so it needs the prerequisites listed
 under [Building from source](#building-from-source).
