@@ -2,8 +2,10 @@ Porting notes
 =============
 
 Findings from porting the pure-Python/OpenCV implementation to Rust. The
-original is preserved under `tests/reference/` and the comparison harness in
-`tests/` checks the port against it.
+figures here were measured with a comparison harness that ran the port against
+the original, kept under `tests/reference/`. Both were removed once the two
+implementations were meant to diverge; the last commit carrying them is
+`638c5f0`.
 
 Layout
 ------
@@ -12,8 +14,7 @@ Layout
     crates/focusweave-cli/    a thin wrapper around core::cli
     crates/focusweave-py/     PyO3 bindings, built as focusweave._core
     python/focusweave/        the Python package: dataclasses and signatures
-    tests/reference/          the original implementation, kept for comparison
-    tests/                    the comparison harness
+    ci/                       the OpenCV build and the artifact bundlers
 
 The CLI argument parser lives in the core crate so the native binary and the
 `focusweave` console script cannot drift apart.
@@ -93,8 +94,8 @@ of either threshold can fall on opposite sides in the two implementations, and
 then a frame is either warped or copied. On the synthetic 8-frame set this
 happens with `--reference 0`, which chains seven warps in one direction and
 arrives at a translation norm of 5.045 in one implementation and just under
-5.0 in the other. `tests/compare_warps.py` checks registration accuracy
-directly, before that gate, for exactly this reason.
+5.0 in the other. The harness compared registration accuracy directly,
+before that gate, for exactly this reason.
 
 Defects found in the original
 -----------------------------

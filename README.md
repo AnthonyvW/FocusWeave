@@ -100,6 +100,26 @@ Slabbing splits a large image set into overlapping sub-stacks, stacks each one i
     --slab-format EXT       File format for slab output images (e.g. tiff, png, jpg).
                             Defaults to tiff. Requires --output-steps or --only-slab.
 
+**Batch options**
+
+Batch mode stacks a folder of folders, treating each subfolder as its own set:
+
+    focusweave --batch path/to/shoot/
+    focusweave --batch path/to/shoot/ --output path/to/results/
+
+    --batch FOLDER          Stack each subfolder of FOLDER separately. Results are
+                            JPEGs named after their subfolder, written into FOLDER,
+                            or into --output, which is then a folder rather than a
+                            file. Every other option applies to each set. A set that
+                            fails is reported and the rest carry on.
+
+**Other**
+
+    --timings               Print how long each stage took.
+    --version, -V           Show the version number and exit.
+    --opencv-version        Show the version of the OpenCV library in use and exit.
+    --formats               List the supported image extensions and exit.
+
 Memory usage
 ------------
 Peak memory is roughly 110 MB per megapixel of output per worker. The worker
@@ -228,15 +248,12 @@ deliberately differ.
 
 Testing
 -------
-The original pure-Python/OpenCV implementation is preserved under
-`tests/reference/`, and the port is validated against it:
 
-    pip install -r tests/requirements.txt
-    cargo build --release -p focusweave-cli
-    maturin develop --release
-    python tests/run_all.py
+    cargo test --workspace
 
-`cargo test` covers the parts that stand alone from image data.
+covers the parts that stand alone from image data. The port was validated
+against the original Python implementation until the two were meant to
+diverge; the last commit with that comparison is `638c5f0`.
 
 Algorithms
 ----------

@@ -3,21 +3,33 @@
 
 use crate::config::{run, FocusStackConfig, Images, RunResult};
 use crate::hooks::{Error, Hooks, Stage};
-use crate::image_source::{save_image, ImageBuf, IMAGE_EXTENSIONS};
+use crate::image_source::{is_image_path, list_folder, save_image, ImageBuf, IMAGE_EXTENSIONS};
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Where slab images go, relative to the output. Also the one subfolder a batch
+/// never treats as an image set, since a previous run may have created it.
+const SLAB_DIR: &str = "focusweave_slabs";
+
 const HELP: &str = r#"Focus stack a folder of images using Laplacian pyramid fusion.
 
 Usage: focusweave FOLDER [OPTIONS]
+       focusweave --batch FOLDER [OPTIONS]
 
 Output options
   --output PATH           Output file path (default: stacked.jpg inside the input
-                          folder). Format is inferred from the extension.
+                          folder). Format is inferred from the extension. With
+                          --batch, a folder to write every result into instead.
   --quality N             JPEG output quality 1-95 (default: 95).
+
+Batch options
+  --batch FOLDER          Stack each subfolder of FOLDER as a separate set of
+                          images. Each result is saved as a JPEG named after its
+                          subfolder, in FOLDER itself unless --output names
+                          another folder. Every other option applies to each set.
 
 Alignment options
   --no-align              Skip alignment (use when images are already registered).
@@ -65,7 +77,8 @@ Slabbing options
 Other
   --timings               Print how long each stage took after the run. Useful
                           when reporting a slow run.
-  --version               Show the version number and exit.
+  --version, -V           Show the version number and exit.
+  --opencv-version        Show the version of the OpenCV library in use and exit.
   --formats               List the supported image extensions and exit.
   --help                  Show this message and exit.
 "#;
@@ -73,6 +86,7 @@ Other
 #[derive(Default)]
 struct Args {
     folder: Option<PathBuf>,
+    batch: Option<PathBuf>,
     output: Option<PathBuf>,
     quality: Option<u8>,
     slab_format: Option<String>,
@@ -116,8 +130,12 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
                 print!("{HELP}");
                 return Ok(None);
             }
-            "--version" => {
+            "--version" | "-V" => {
                 println!("focusweave {VERSION}");
+                return Ok(None);
+            }
+            "--opencv-version" => {
+                println!("OpenCV {}", crate::cv::opencv_version());
                 return Ok(None);
             }
             "--formats" => {
@@ -125,6 +143,7 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
                 println!("  {}", IMAGE_EXTENSIONS.join("  "));
                 return Ok(None);
             }
+            "--batch" => args.batch = Some(PathBuf::from(next(&mut i, "batch")?)),
             "--output" => args.output = Some(PathBuf::from(next(&mut i, "output")?)),
             "--quality" => args.quality = Some(parse_number("quality", &next(&mut i, "quality")?)?),
             "--slab-format" => args.slab_format = Some(next(&mut i, "slab-format")?),
@@ -187,14 +206,33 @@ fn parse(argv: &[String]) -> Result<Option<Parsed>, String> {
         i += 1;
     }
 
-    let folder = args
-        .folder
-        .clone()
-        .ok_or_else(|| "the following arguments are required: folder".to_string())?;
-    if !folder.is_dir() {
-        return Err(format!("'{}' is not a directory.", folder.display()));
+    match (&args.folder, &args.batch) {
+        (Some(_), Some(_)) => {
+            return Err("give either a folder or --batch FOLDER, not both".into());
+        }
+        (None, None) => {
+            return Err("the following arguments are required: folder (or --batch FOLDER)".into());
+        }
+        (Some(folder), None) => {
+            if !folder.is_dir() {
+                return Err(format!("'{}' is not a directory.", folder.display()));
+            }
+            cfg.images = Images::Folder(folder.clone());
+        }
+        (None, Some(batch)) => {
+            if !batch.is_dir() {
+                return Err(format!("'{}' is not a directory.", batch.display()));
+            }
+            // A name like results.tiff reads as a file, and would otherwise
+            // quietly become a folder holding every result.
+            if let Some(output) = args.output.as_deref().filter(|p| is_image_path(p)) {
+                return Err(format!(
+                    "with --batch, --output is the folder to write results into, not a file: '{}'",
+                    output.display()
+                ));
+            }
+        }
     }
-    cfg.images = Images::Folder(folder);
     Ok(Some(Parsed { cfg, args }))
 }
 
@@ -278,24 +316,137 @@ pub fn run_cli(argv: &[String]) -> i32 {
 
 fn execute(parsed: Parsed) -> Result<(), Error> {
     let Parsed { cfg, args } = parsed;
-    let folder = match &cfg.images {
-        Images::Folder(f) => f.clone(),
-        _ => unreachable!("the CLI only builds folder sources"),
+    let timer = RefCell::new(StageTimer::default());
+    let start = Instant::now();
+
+    let failed = match &args.batch {
+        Some(batch) => execute_batch(&cfg, &args, batch, &timer)?,
+        None => {
+            let folder = match &cfg.images {
+                Images::Folder(f) => f.clone(),
+                _ => unreachable!("the CLI only builds folder sources"),
+            };
+            let out_path = args
+                .output
+                .clone()
+                .unwrap_or_else(|| folder.join("stacked.jpg"));
+            let steps_dir = out_path.parent().unwrap_or(Path::new(".")).join(SLAB_DIR);
+            stack_one(&cfg, &args, &out_path, &steps_dir, &timer)?;
+            0
+        }
     };
-    let out_path = args
-        .output
-        .clone()
-        .unwrap_or_else(|| folder.join("stacked.jpg"));
+
+    println!("Done ({:.2}s total)", start.elapsed().as_secs_f64());
+    if args.timings {
+        timer.borrow().report(start.elapsed());
+    }
+    if failed > 0 {
+        return Err(Error::Config(format!("{failed} set(s) failed")));
+    }
+    Ok(())
+}
+
+/// Stack each image-bearing subfolder of `batch` as its own set. A set that
+/// fails is reported and skipped rather than abandoning the rest of the
+/// batch; the return value is how many failed.
+fn execute_batch(
+    cfg: &FocusStackConfig,
+    args: &Args,
+    batch: &Path,
+    timer: &RefCell<StageTimer>,
+) -> Result<usize, Error> {
+    let out_dir = args.output.clone().unwrap_or_else(|| batch.to_path_buf());
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| Error::Config(format!("could not create '{}': {e}", out_dir.display())))?;
+
+    let sets = discover_sets(batch, &out_dir)?;
+    if sets.is_empty() {
+        return Err(Error::Config(format!(
+            "no subfolder of '{}' contains images",
+            batch.display()
+        )));
+    }
+
+    let mut failed = Vec::new();
+    for (index, folder) in sets.iter().enumerate() {
+        let name = folder
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        println!("\n[{}/{}] {name}", index + 1, sets.len());
+
+        let mut set_cfg = cfg.clone();
+        set_cfg.images = Images::Folder(folder.clone());
+        let out_path = out_dir.join(format!("{name}.jpg"));
+        let steps_dir = out_dir.join(SLAB_DIR).join(&name);
+        match stack_one(&set_cfg, args, &out_path, &steps_dir, timer) {
+            Ok(()) => {}
+            Err(Error::Interrupted) => return Err(Error::Interrupted),
+            Err(e) => {
+                eprintln!("Error in {name}: {e}");
+                failed.push(name);
+            }
+        }
+    }
+
+    println!(
+        "\nStacked {} of {} sets into {}",
+        sets.len() - failed.len(),
+        sets.len(),
+        out_dir.display()
+    );
+    if !failed.is_empty() {
+        println!("Failed: {}", failed.join(", "));
+    }
+    Ok(failed.len())
+}
+
+/// Subfolders of `batch` holding at least one image, sorted by name.
+///
+/// The output folder and the slab folder are left out even when they sit
+/// inside `batch`: both fill with images, and without this a second run of the
+/// same batch would stack its own previous results as another set.
+fn discover_sets(batch: &Path, out_dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let entries = std::fs::read_dir(batch)
+        .map_err(|e| Error::Config(format!("could not read '{}': {e}", batch.display())))?;
+    let out_dir = out_dir.canonicalize().ok();
+
+    let mut sets = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name == SLAB_DIR {
+            continue;
+        }
+        if out_dir.is_some() && path.canonicalize().ok() == out_dir {
+            continue;
+        }
+        match list_folder(&path) {
+            Ok(images) if images.is_empty() => println!("Skipping {name}: no images"),
+            Ok(_) => sets.push(path),
+            Err(e) => println!("Skipping {name}: {e}"),
+        }
+    }
+    sets.sort();
+    Ok(sets)
+}
+
+/// Stack one folder and write the result, or its slabs, to disk.
+fn stack_one(
+    cfg: &FocusStackConfig,
+    args: &Args,
+    out_path: &Path,
+    steps_dir: &Path,
+    timer: &RefCell<StageTimer>,
+) -> Result<(), Error> {
     let quality = args.quality.unwrap_or(95);
     let emit_steps = args.output_steps || args.only_slab;
-    let steps_dir = out_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("focusweave_slabs");
     let slab_ext = args.slab_format.clone().unwrap_or_else(|| "tiff".into());
     let slab_ext = slab_ext.trim_start_matches('.').to_string();
 
-    let timer = RefCell::new(StageTimer::default());
     let progress = |fraction: f64, stage: Stage, message: &str| {
         if args.timings {
             timer.borrow_mut().observe(stage);
@@ -305,7 +456,7 @@ fn execute(parsed: Parsed) -> Result<(), Error> {
         }
     };
     let on_slab = |label: &str, image: &ImageBuf| {
-        if std::fs::create_dir_all(&steps_dir).is_err() {
+        if std::fs::create_dir_all(steps_dir).is_err() {
             eprintln!("Warning: could not create {}", steps_dir.display());
             return;
         }
@@ -327,21 +478,19 @@ fn execute(parsed: Parsed) -> Result<(), Error> {
         on_slab: if emit_steps { Some(&on_slab) } else { None },
     };
 
-    let start = Instant::now();
-    let result: RunResult = run(&cfg, &hooks)?;
+    let result: Result<RunResult, Error> = run(cfg, &hooks);
     if args.timings {
+        // Closed here rather than left open, so the time spent saving, and in
+        // a batch the gap before the next set, is not billed to the last stage.
         timer.borrow_mut().finish();
     }
+    let result = result?;
 
     if let Some(slabs) = result.slabs {
         if emit_steps {
             println!("Slabs saved to: {}", steps_dir.display());
         }
         println!("Produced {} slab(s)", slabs.len());
-        println!("Done ({:.2}s total)", start.elapsed().as_secs_f64());
-        if args.timings {
-            timer.borrow().report(start.elapsed());
-        }
         return Ok(());
     }
 
@@ -349,15 +498,11 @@ fn execute(parsed: Parsed) -> Result<(), Error> {
         .image
         .expect("a non-slab run always produces an image");
     let t_save = Instant::now();
-    save_image(&image, &out_path, quality)?;
+    save_image(&image, out_path, quality)?;
     println!(
         "Saved: {} ({:.2}s)",
         out_path.display(),
         t_save.elapsed().as_secs_f64()
     );
-    println!("Done ({:.2}s total)", start.elapsed().as_secs_f64());
-    if args.timings {
-        timer.borrow().report(start.elapsed());
-    }
     Ok(())
 }

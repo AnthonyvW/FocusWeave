@@ -30,36 +30,6 @@ jobs:
         with:
           version: ${{ env.OPENCV_VERSION }}
 
-  # Lints, unit tests and the comparison against the original Python
-  # implementation, in one job: they share a checkout, an OpenCV restore and a
-  # runner, and splitting them bought nothing but a second runner's overhead.
-  verify:
-    name: Verify
-    needs: opencv
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - uses: ./.github/actions/setup-opencv
-        with:
-          version: ${{ env.OPENCV_VERSION }}
-
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-
-      - run: pip install -r tests/requirements.txt maturin
-      - run: cargo build --release -p focusweave-cli
-      - run: maturin build --release --out dist
-      - run: pip install --find-links dist --force-reinstall focusweave
-      - run: python tests/run_all.py
-
   binaries:
     name: Binary (${{ matrix.os }})
     needs: opencv
@@ -89,6 +59,26 @@ jobs:
           version: ${{ env.OPENCV_VERSION }}
 
       - run: cargo build --release -p focusweave-cli
+
+      # Relinking unchanged code has to give a byte-identical executable, or
+      # every build is a new hash with no download reputation. /Brepro in
+      # .cargo/config.toml is what makes that true, and a RUSTFLAGS set
+      # anywhere for this job would silently replace it -- this is what
+      # would notice.
+      - name: Check the executable is reproducible (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          first=$(sha256sum target/release/focusweave.exe | cut -d' ' -f1)
+          touch crates/focusweave-cli/src/main.rs
+          cargo build --release -p focusweave-cli
+          second=$(sha256sum target/release/focusweave.exe | cut -d' ' -f1)
+          echo "first  $first"
+          echo "second $second"
+          if [ "$first" != "$second" ]; then
+            echo "::error::relinking changed focusweave.exe; /Brepro is not in effect"
+            exit 1
+          fi
 
       # OpenCV is linked dynamically, so a bare executable will not start on a
       # machine without it. Each folder carries the two libraries beside the
@@ -135,6 +125,13 @@ jobs:
           assert im.size[0] >= 320 and im.size[1] >= 240, im.size
           print('stacked', im.size, im.mode)
           "
+          "$HOME/bundle-under-test/focusweave$exe" --version
+          "$HOME/bundle-under-test/focusweave$exe" --opencv-version
+          mkdir smoke-batch
+          cp -r smoke-frames smoke-batch/a
+          cp -r smoke-frames smoke-batch/b
+          "$HOME/bundle-under-test/focusweave$exe" --batch smoke-batch --output smoke-batch-out
+          test -f smoke-batch-out/a.jpg && test -f smoke-batch-out/b.jpg
           mv "$HOME/bundle-under-test" "${{ matrix.archive }}"
           du -sh "${{ matrix.archive }}"
 

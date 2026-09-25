@@ -16,6 +16,13 @@ use opencv::core::{BorderTypes, Mat as CvMat, Point, Scalar, Size};
 use opencv::imgproc;
 use opencv::prelude::*;
 
+/// The version of the OpenCV library loaded at run time. This is asked of the
+/// library itself rather than taken from the headers the build compiled
+/// against, because a dynamically linked copy can be swapped underneath.
+pub fn opencv_version() -> String {
+    opencv::core::get_version_string().unwrap_or_else(|_| "unknown".into())
+}
+
 /// Resampling kernel, mapped straight onto OpenCV's interpolation flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interp {

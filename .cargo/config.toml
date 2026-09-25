@@ -1,0 +1,10 @@
+# By default the MSVC linker stamps every executable with the time it was
+# linked and a random signature for its debug symbols, so rebuilding unchanged
+# source produced a new file hash each time -- and every new hash of an
+# unsigned executable starts with no download reputation. /Brepro derives both
+# from the output's contents instead.
+#
+# RUSTFLAGS, if set, replaces this rather than adding to it, so anything that
+# sets it for a Windows build has to carry the flag itself.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/Brepro"]

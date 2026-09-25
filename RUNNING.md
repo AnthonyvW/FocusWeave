@@ -14,7 +14,7 @@ Contents:
 3. [Run the CLI](#3-run-the-cli)
 4. [Build and use the Python package](#4-build-and-use-the-python-package)
 5. [Make yourself a test stack](#5-make-yourself-a-test-stack)
-6. [Check it against the old implementation](#6-check-it-against-the-old-implementation)
+6. [Stack many sets at once](#6-stack-many-sets-at-once)
 7. [What to look at first](#7-what-to-look-at-first)
 8. [Troubleshooting](#8-troubleshooting)
 
@@ -151,7 +151,7 @@ Three flags to know about while testing:
   individual kernel parallelises — so this is the knob that matters most. The
   line `Fusing (N workers)` reports what was chosen.
 - `--no-align` skips registration. Useful for isolating the fusion stage when
-  comparing output against the old implementation.
+  comparing output between runs.
 - `--timings` prints where the time went. Start here if a run is slower than
   you expect:
 
@@ -278,52 +278,42 @@ The result should be sharp edge to edge, where each input frame is sharp only
 in one band.
 
 
-6. Check it against the old implementation
-------------------------------------------
+6. Stack many sets at once
+--------------------------
 
-The original pure-Python/OpenCV code is preserved verbatim under
-`tests/reference/`, and the scripts in `tests/` compare the two directly.
+`--batch` takes a folder of folders and stacks each subfolder as its own set:
 
-    pip install -r tests/requirements.txt
-    cargo build --release -p focusweave-cli
-    maturin develop --release
-    python tests/run_all.py
+    shoot/
+      beetle/        frame_01.tiff  frame_02.tiff  ...
+      moss/          IMG_4410.jpg   IMG_4411.jpg   ...
+      pollen/        ...
 
-Stages can be run individually — `python tests/run_all.py primitives warps` —
-and each script also runs standalone. What they cover:
+    ./target/release/focusweave --batch shoot/
+    ./target/release/focusweave --batch shoot/ --output results/ --crop
 
-| stage          | what it compares                                             |
-| -------------- | ------------------------------------------------------------ |
-| `primitives`   | every filter, colour and resampling routine vs OpenCV         |
-| `registration` | `phaseCorrelate` and `findTransformECC` vs OpenCV             |
-| `warps`        | per-pair alignment on a real stack                            |
-| `pipeline`     | end-to-end output across 16 flag combinations                 |
-| `bindings`     | the whole Python API surface, callbacks included              |
-| `streaming`    | the incremental stacker and its previews                      |
+Each result is a JPEG named after its subfolder — `beetle.jpg`, `moss.jpg`,
+`pollen.jpg` — written into `shoot/` itself, or into the folder `--output`
+names, which is created if it does not exist. With `--batch`, `--output` is
+always a folder; a name ending in an image extension is rejected rather than
+quietly turned into one. Every other flag applies to each set, and
+`--output-steps` puts each set's slabs in `focusweave_slabs/<set>/`.
 
-Expected results, which the scripts assert:
+Subfolders with no images are skipped with a note, and hidden folders are
+ignored. A set that fails — too few images, a file that will not decode — is
+reported and the batch carries on; the summary at the end names the failures,
+and the exit code is 1 if there were any.
 
-- Filtering, resampling, warping and colour conversion go through the same
-  OpenCV routines the reference calls, so they are exact against the same
-  OpenCV. The harness normally runs a pip `opencv-python` against a system
-  OpenCV of a different major version, and then a few of them drift: cubic
-  `warpAffine` by up to 2 of 255 and wide `GaussianBlur` by about 5e-5. Both
-  are version differences in OpenCV's own fixed-point tables, not the port.
-- With `--no-align`, stacked output differs from the reference by at most 1 of
-  255, on a handful of pixels.
-- Phase correlation agrees to about 3e-6 px.
-- Unmasked ECC agrees to about 1e-7; masked ECC, which is what the pipeline
-  actually uses, agrees to within 0.07 px of translation. That is the port's
-  one real numerical difference, and it is why aligned output can differ by a
-  dozen levels on high-frequency texture — sub-pixel registration showing up
-  as resampling noise, not a change in what the algorithm does.
+Re-running the same command is safe: the output folder and
+`focusweave_slabs/` are never treated as sets, even when they sit inside the
+batch folder. What is not detected is a *different* earlier output folder —
+a `results/` from a previous run with another `--output` is just a subfolder
+full of images, and gets stacked like one.
 
 `cargo test` covers the parts that stand alone from image data: the 2x2 SVD,
 warp constraints, pyramid round-tripping, canvas layout, slab index arithmetic,
-DFT sizing.
-
-`tests/compare_pipeline.py` honours `FOCUSWEAVE_BIN` if you want to point it at
-a binary somewhere other than `target/release/focusweave`.
+DFT sizing. The comparison against the original Python implementation was
+retired once the two stopped being meant to match; the last commit carrying it
+is `638c5f0`, and `docs/PORTING-NOTES.md` records what it found.
 
 
 7. What to look at first
@@ -342,8 +332,6 @@ synthetic tests only prove the port is faithful, not that you like the output.
 | ----------------- | ------- |
 | Rust + OpenCV     | 6.3 s   |
 | Python + OpenCV   | 9.6 s   |
-
-Reproduce with `python tests/bench_all.py target/bigstack`.
 
 The margin is larger on a machine with more cores, because the Python
 implementation's fusion loop is per-frame NumPy and the Rust one fuses several
@@ -413,14 +401,15 @@ first time. After that, `cargo build --offline` works.
 **`maturin develop` says it cannot find a virtualenv.** Activate one first, or
 use `maturin build` and `pip install` the wheel.
 
-**`import focusweave` picks up the wrong package.** The reference
-implementation under `tests/reference/` is also called `focusweave`. It is
-only importable when that directory is on `sys.path`, which the comparison
-scripts do deliberately. Do not add it to `PYTHONPATH` for normal use.
+**Output differs between two machines.** Check `focusweave --opencv-version`
+on both. It reports the OpenCV library actually loaded at run time, which for a
+build linked against a system OpenCV is whatever that system has, not what the
+build was compiled against.
 
-**The comparison scripts fail on `import cv2`.** They need
-`pip install -r tests/requirements.txt`; the `focusweave` package itself needs
-only numpy.
+**Re-running a folder stacks the previous result into itself.** The default
+output, `stacked.jpg`, is written inside the input folder, and the next run of
+that folder sees it as one more frame. This is how the original behaved too.
+Pass `--output` somewhere else, or delete it before re-running.
 
 **WebP output fails.** WebP encoding is lossless-only here, and 16-bit images
 are reduced to 8-bit for it, as for JPEG. Prefer PNG or TIFF for 16-bit

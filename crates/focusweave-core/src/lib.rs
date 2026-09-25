@@ -22,4 +22,3 @@ pub mod memory;
 pub mod pyramid;
 pub mod stack;
 pub mod streaming;
-pub mod testio;
